@@ -901,14 +901,15 @@ def combine_videos(
                 clip = shuffle_transition(clip)
 
             target_duration = subclipped_item.target_duration
-            if target_duration is not None and clip.duration > target_duration:
-                clip = clip.subclipped(0, target_duration)
-            elif target_duration is not None and clip.duration + (1 / fps) < target_duration:
-                raise ValueError(
-                    "timed visual material became shorter after processing: "
-                    f"index={i + 1}, output={clip.duration:.3f}s, "
-                    f"required={target_duration:.3f}s"
-                )
+            if target_duration is not None:
+                if clip.duration > target_duration:
+                    clip = clip.subclipped(0, target_duration)
+                elif clip.duration + (1 / fps) < target_duration:
+                    raise ValueError(
+                        "timed visual material became shorter after processing: "
+                        f"index={i + 1}, output={clip.duration:.3f}s, "
+                        f"required={target_duration:.3f}s"
+                    )
             elif clip.duration > max_clip_duration:
                 clip = clip.subclipped(0, max_clip_duration)
                 

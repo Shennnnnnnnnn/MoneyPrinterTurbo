@@ -852,6 +852,57 @@ class TestVideoService(unittest.TestCase):
         self.assertTrue(clip_files[1].endswith("temp-clip-2.mp4"))
         self.assertEqual(concat.call_args.kwargs["max_duration"], 5.0)
 
+    def test_combine_videos_does_not_cap_timed_paragraphs_at_max_clip_duration(self):
+        class _FakeAudioClip:
+            duration = 13.0
+
+            def close(self):
+                pass
+
+        class _FakeVideoClip:
+            def __init__(self, duration):
+                self.duration = duration
+                self.size = (1080, 1920)
+                self.w = 1080
+                self.h = 1920
+
+            def subclipped(self, start_time, end_time):
+                return _FakeVideoClip(end_time - start_time)
+
+            def with_speed_scaled(self, factor):
+                return _FakeVideoClip(self.duration / factor)
+
+        written_durations = []
+        source_durations = {"first.mp4": 6.1, "second.mp4": 7.1}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(vd, "AudioFileClip", return_value=_FakeAudioClip()),
+                patch.object(
+                    vd,
+                    "_open_video_clip_quietly",
+                    side_effect=lambda path: _FakeVideoClip(source_durations[path]),
+                ),
+                patch.object(
+                    vd,
+                    "_write_videofile_with_codec_fallback",
+                    side_effect=lambda clip, *_args, **_kwargs: written_durations.append(
+                        clip.duration
+                    ),
+                ),
+                patch.object(vd, "concat_video_clips_with_ffmpeg"),
+                patch.object(vd, "delete_files"),
+            ):
+                vd.combine_videos(
+                    combined_video_path=os.path.join(temp_dir, "combined.mp4"),
+                    video_paths=["first.mp4", "second.mp4"],
+                    audio_file="audio.mp3",
+                    max_clip_duration=5,
+                    clip_durations=[6.0, 7.0],
+                )
+
+        self.assertEqual(written_durations, [6.0, 7.0])
+
     def _capture_source_ranges_for_clip_speed(
         self,
         *,
