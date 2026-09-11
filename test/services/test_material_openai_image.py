@@ -917,16 +917,34 @@ class TestOpenAIImageProvider(unittest.TestCase):
         )
         self.assertCountEqual(
             [call.kwargs["minimum_duration"] for call in generate.call_args_list],
-            [5, 7],
+            [3, 4],
         )
-        self.assertAlmostEqual(render.call_args_list[0].args[1], 4 + 1 / 30)
-        self.assertAlmostEqual(render.call_args_list[1].args[1], 6 + 1 / 30)
+        self.assertAlmostEqual(render.call_args_list[0].args[1], 2 + 1 / 30)
+        self.assertAlmostEqual(render.call_args_list[1].args[1], 3 + 1 / 30)
         self.assertEqual(result, ["/tmp/first.png.mp4", "/tmp/second.png.mp4"])
         saved_sources = persist.call_args.args[1]
         self.assertEqual(
             [item["script_segment_index"] for item in saved_sources],
             [1, 2],
         )
+
+    def test_render_openai_image_video_uses_static_image_renderer(self):
+        with (
+            patch.object(
+                material.video,
+                "render_image_video",
+                return_value="/tmp/static-image.mp4",
+                create=True,
+            ) as render_static,
+            patch.object(material.video, "render_image_zoom_video") as render_zoom,
+        ):
+            result = material._render_openai_image_video(
+                "/tmp/generated.png", 3.5
+            )
+
+        self.assertEqual(result, "/tmp/static-image.mp4")
+        render_static.assert_called_once_with("/tmp/generated.png", 3.5)
+        render_zoom.assert_not_called()
 
     def test_download_videos_openai_image_generates_paragraphs_concurrently(self):
         segments = [

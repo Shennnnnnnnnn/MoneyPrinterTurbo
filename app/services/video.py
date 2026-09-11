@@ -1536,14 +1536,24 @@ def generate_video(
         return bgm_mix_succeeded
 
 
+def render_image_video(image_path: str, clip_duration: float = 5) -> str:
+    """将单张图片渲染为保持静止画面的 mp4 片段。"""
+    clip = ImageClip(image_path).with_duration(float(clip_duration)).with_position("center")
+    try:
+        video_file = f"{image_path}.mp4"
+        clip.write_videofile(video_file, fps=fps, logger=None)
+        return video_file
+    finally:
+        close_clip(clip)
+
+
 def render_image_zoom_video(image_path: str, clip_duration: int = 5) -> str:
     """
     将单张本地图片渲染为带缓慢放大效果的 mp4 片段，返回输出文件路径。
 
-    local 素材预处理和 OpenAI 兼容文生图素材共用这段"图片 → 片段"渲染
-    逻辑：ImageClip 按 clip_duration 固定时长播放，并叠加每秒约 3% 的
-    动态放大，避免静态画面在成片中显得呆板。渲染异常由调用方按各自
-    素材源的失败约定处理。
+    local 素材预处理使用这段"图片 → 动态片段"渲染逻辑；OpenAI 文生图
+    素材使用 ``render_image_video``，避免生成画面被动态放大。渲染异常由
+    调用方按各自素材源的失败约定处理。
     """
     clip = ImageClip(image_path).with_duration(clip_duration).with_position("center")
     try:

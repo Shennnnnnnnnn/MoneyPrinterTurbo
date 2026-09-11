@@ -747,6 +747,9 @@ def get_video_materials(
             return None
     else:
         logger.info(f"\n\n## downloading videos from {params.video_source}")
+        timed_openai_images = params.video_source == "openai_image" and bool(
+            script_segments
+        )
         # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
         # 轮询，避免某个早期关键词下载太多素材，把后续脚本主题挤出最终时间线。
         try:
@@ -764,7 +767,7 @@ def get_video_materials(
                 max_clip_duration=params.video_clip_duration,
                 match_script_order=params.match_materials_to_script,
                 script_segments=script_segments,
-                clip_speed=params.video_clip_speed,
+                clip_speed=1.0 if timed_openai_images else params.video_clip_speed,
             )
         except volcengine_seedance.VolcEngineSeedanceError as exc:
             # 未确认状态和已生成但下载失败都对应一个可在方舟控制台恢复的远端
@@ -916,6 +919,9 @@ def generate_final_videos(
         video_music_provider is not None
         and bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
     )
+    timed_openai_images = params.video_source == "openai_image" and bool(
+        script_segments
+    )
     # 多视频生成默认会打散素材以增加差异；但“按文案顺序匹配素材”追求的是
     # 时间线稳定性和可解释性，所以开启后所有输出都使用顺序拼接。
     if params.video_source == "openai_image" and script_segments:
@@ -954,7 +960,7 @@ def generate_final_videos(
             video_transition_mode=video_transition_mode,
             max_clip_duration=params.video_clip_duration,
             threads=params.n_threads,
-            clip_speed=params.video_clip_speed,
+            clip_speed=1.0 if timed_openai_images else params.video_clip_speed,
             clip_durations=(
                 [float(segment["duration"]) for segment in script_segments]
                 if params.video_source == "openai_image" and script_segments

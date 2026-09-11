@@ -1505,12 +1505,12 @@ def generate_images_openai(
 
 def _render_openai_image_video(image_path: str, clip_duration: int) -> str:
     """
-    把生成的图片渲染成 mp4 片段，复用 local 素材的"图片 → 动态片段"管线。
+    把生成的图片渲染成保持静止画面的 mp4 片段。
 
     渲染失败按素材源约定返回空字符串，由调用方跳过该图片继续。
     """
     try:
-        return video.render_image_zoom_video(image_path, clip_duration)
+        return video.render_image_video(image_path, clip_duration)
     except Exception as e:
         logger.error(
             "failed to render generated image as a video clip: "
@@ -1611,7 +1611,10 @@ def _download_openai_images_for_script_segments(
     if not material_directory:
         material_directory = utils.task_dir(task_id)
 
-    normalized_speed = utils.normalize_clip_speed(clip_speed)
+    # Script-timed OpenAI images are narration-bound. Do not apply the global
+    # visual speed setting here, otherwise a paragraph can finish before its
+    # spoken content and the next image will appear too early.
+    normalized_speed = 1.0
     prepared_segments: list[tuple[int, dict[str, Any], str, float, int, float]] = []
     for expected_index, segment in enumerate(script_segments, start=1):
         text = str(segment.get("text") or "").strip()

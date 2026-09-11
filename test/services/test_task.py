@@ -124,6 +124,7 @@ class TestTaskService(unittest.TestCase):
             video_subject="test",
             video_source="openai_image",
             video_concat_mode="random",
+            video_clip_speed=1.75,
         )
         segments = [
             {"text": "First.", "duration": 2.25},
@@ -153,6 +154,7 @@ class TestTaskService(unittest.TestCase):
             combine_videos.call_args.kwargs["clip_durations"],
             [2.25, 3.75],
         )
+        self.assertEqual(combine_videos.call_args.kwargs["clip_speed"], 1.0)
 
     def test_generate_final_videos_uses_generated_sonilo_music(self):
         """Sonilo 必须针对每条拼接后的视频生成配乐，并传给最终混音。"""
