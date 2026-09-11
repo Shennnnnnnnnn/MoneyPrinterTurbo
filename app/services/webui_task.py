@@ -56,6 +56,7 @@ def _run_generation(
     capture_logs: bool,
     voice_preview: dict | None = None,
     loomloom_video_request: LoomLoomConfirmedVideoRequest | None = None,
+    stop_at: str = "video",
 ) -> dict:
     """
     在后台线程中执行现有视频流水线。
@@ -82,6 +83,7 @@ def _run_generation(
             return tm.start(
                 task_id=task_id,
                 params=params,
+                stop_at=stop_at,
                 voice_preview=voice_preview,
                 loomloom_video_request=loomloom_video_request,
             )
@@ -132,6 +134,7 @@ def submit_generation(
     capture_logs: bool = True,
     voice_preview: dict | None = None,
     loomloom_video_request: LoomLoomConfirmedVideoRequest | None = None,
+    stop_at: str = "video",
 ) -> None:
     """
     登记并提交 WebUI 视频生成任务，调用后立即返回。
@@ -150,12 +153,14 @@ def submit_generation(
         task_id,
         state=const.TASK_STATE_PROCESSING,
         progress=0,
+        image_generation_only=stop_at == "images",
         video_subject=task_params.video_subject or task_params.video_script or task_id,
     )
     tm.record_task_status(
         task_id,
         state=const.TASK_STATE_PROCESSING,
         progress=0,
+        image_generation_only=stop_at == "images",
         video_subject=task_params.video_subject or task_params.video_script or task_id,
     )
     try:
@@ -164,6 +169,7 @@ def submit_generation(
             task_id=task_id,
             params=task_params,
             capture_logs=capture_logs,
+            stop_at=stop_at,
             voice_preview=voice_preview_snapshot,
             loomloom_video_request=loomloom_request_snapshot,
         )

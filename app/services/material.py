@@ -1440,6 +1440,25 @@ def _save_openai_image_file(
     return image_path, width, height
 
 
+def _rename_openai_image_with_segment_index(image_path: str, segment_index: int) -> str:
+    """Append the script paragraph number to a generated image filename."""
+    source = Path(image_path)
+    if not source.is_file():
+        return image_path
+    target = source.with_name(f"{segment_index}-{source.stem}{source.suffix}")
+    if target == source:
+        return image_path
+    try:
+        os.replace(source, target)
+    except OSError as exc:
+        logger.warning(
+            "failed to add script segment index to generated image filename: "
+            f"image={image_path}, index={segment_index}, error={exc}"
+        )
+        return image_path
+    return str(target)
+
+
 def generate_images_openai(
     search_term: str,
     minimum_duration: int,
@@ -1736,6 +1755,9 @@ def _download_openai_images_for_script_segments(
         duration,
     ) in prepared_segments:
         item = generated_items[expected_index]
+        item.url = _rename_openai_image_with_segment_index(
+            item.url, expected_index
+        )
         video_file = _render_openai_image_video(item.url, source_duration)
         if not video_file:
             logger.error(
@@ -1768,6 +1790,106 @@ def _download_openai_images_for_script_segments(
     )
     _persist_material_sources(task_id, material_sources)
     return video_paths
+
+
+def generate_openai_images_for_script_paragraphs(
+    *,
+    task_id: str,
+    paragraphs: list[str],
+    video_aspect: VideoAspect,
+    material_directory: str = "",
+) -> List[str]:
+    """Generate one PNG image for each already segmented script paragraph."""
+    clean_paragraphs = [str(paragraph or "").strip() for paragraph in paragraphs]
+    if not clean_paragraphs or any(not paragraph for paragraph in clean_paragraphs):
+        logger.error("invalid script paragraphs for image-only generation")
+        return []
+    if not material_directory:
+        material_directory = utils.task_dir(task_id)
+
+    total_segments = len(clean_paragraphs)
+    parallelism = min(get_openai_image_parallelism(), total_segments)
+    logger.info(
+        "generating images only for script paragraphs: "
+        f"progress=0/{total_segments}, parallelism={parallelism}"
+    )
+    generated_items: dict[int, MaterialInfo] = {}
+    completed_segments = 0
+
+    with ThreadPoolExecutor(
+        max_workers=parallelism,
+        thread_name_prefix="mpt-openai-image-only",
+    ) as executor:
+        futures = {
+            executor.submit(
+                generate_images_openai,
+                search_term=paragraph,
+                minimum_duration=1,
+                video_aspect=video_aspect,
+                save_dir=material_directory,
+            ): index
+            for index, paragraph in enumerate(clean_paragraphs, start=1)
+        }
+        while futures:
+            future = next(as_completed(futures))
+            expected_index = futures.pop(future)
+            try:
+                items = future.result()
+            except Exception as exc:
+                for pending_future in futures:
+                    pending_future.cancel()
+                logger.error(
+                    "image-only generation failed: "
+                    f"progress={completed_segments}/{total_segments}, "
+                    f"index={expected_index}, error={type(exc).__name__}: {exc}"
+                )
+                raise
+            if len(items) != 1:
+                for pending_future in futures:
+                    pending_future.cancel()
+                logger.error(
+                    "image-only generation failed: "
+                    f"progress={completed_segments}/{total_segments}, "
+                    f"index={expected_index}, images={len(items)}"
+                )
+                return []
+            generated_items[expected_index] = items[0]
+            completed_segments += 1
+            logger.info(
+                "image-only generation progress: "
+                f"progress={completed_segments}/{total_segments}, "
+                f"index={expected_index}"
+            )
+
+    image_paths: List[str] = []
+    material_sources: list[dict[str, Any]] = []
+    for expected_index, paragraph in enumerate(clean_paragraphs, start=1):
+        item = generated_items[expected_index]
+        item.url = _rename_openai_image_with_segment_index(
+            item.url, expected_index
+        )
+        image_paths.append(item.url)
+        try:
+            source_record = _material_source_record(item, item.url)
+            source_record.update(
+                {
+                    "script_segment_index": expected_index,
+                    "script_text": paragraph,
+                }
+            )
+            material_sources.append(source_record)
+        except Exception as source_error:
+            logger.warning(
+                "failed to prepare image-only source record: "
+                f"index={expected_index}, error={type(source_error).__name__}, "
+                f"detail={source_error}"
+            )
+
+    _persist_material_sources(task_id, material_sources)
+    logger.success(
+        f"generated {len(image_paths)} images for image-only generation"
+    )
+    return image_paths
 
 
 def _search_videos_with_cache(

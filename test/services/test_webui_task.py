@@ -309,6 +309,20 @@ def test_submit_generation_copies_params_before_starting_worker():
     webui_task.sm.state.delete_task("copied-params-test")
 
 
+def test_submit_generation_forwards_image_only_stage():
+    params = VideoParams(video_subject="Image-only", video_source="openai_image")
+    with patch.object(webui_task._task_manager, "add_task") as add_task:
+        webui_task.submit_generation(
+            "image-only-submit-test",
+            params,
+            capture_logs=False,
+            stop_at="images",
+        )
+
+    assert add_task.call_args.kwargs["stop_at"] == "images"
+    webui_task.sm.state.delete_task("image-only-submit-test")
+
+
 def test_scheduling_failure_is_saved_as_terminal_task_state():
     """队列或线程启动失败时不能让任务管理器永久停留在“生成中”。"""
     task_id = "scheduling-failure-test"

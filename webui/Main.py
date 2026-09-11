@@ -1035,11 +1035,12 @@ def _remove_active_generation_task(task_id):
         del st.session_state["pending_generation_task_id"]
 
 
-def _prepare_generation_task():
+def _prepare_generation_task(mode="video"):
     # st.button 的 on_click 会在页面脚本重新执行前触发。这里提前生成任务 ID，
     # 顶部任务管理入口就能在同一次 rerun 中显示“生成中”数量。
     task_id = str(uuid4())
     st.session_state["pending_generation_task_id"] = task_id
+    st.session_state["pending_generation_mode"] = mode
     subject = st.session_state.get("video_subject") or st.session_state.get(
         "video_script"
     )
@@ -1360,6 +1361,35 @@ def _build_task_file_archive(task_path, files):
 def _dismiss_task_files_dialog():
     _clear_task_file_archive()
     st.session_state.pop("task_files_dialog_path", None)
+    st.session_state.pop("task_file_preview_path", None)
+
+
+def _task_file_preview_kind(file_path):
+    """Return the safe browser preview kind for a task artifact."""
+    mime_type = mimetypes.guess_type(file_path)[0] or ""
+    if mime_type.startswith("image/"):
+        return "image"
+    if mime_type.startswith("video/"):
+        return "video"
+    if mime_type.startswith("audio/"):
+        return "audio"
+    if Path(file_path).suffix.lower() in {".txt", ".md", ".json", ".srt", ".log"}:
+        return "text"
+    return ""
+
+
+def _resolve_task_file_for_preview(task_path, file_path):
+    """Resolve a task artifact for preview without allowing path traversal."""
+    normalized_task = _resolve_task_directory(task_path)
+    normalized_file = os.path.realpath(file_path)
+    if not normalized_task or not os.path.isfile(normalized_file):
+        return ""
+    try:
+        if os.path.commonpath([normalized_task, normalized_file]) != normalized_task:
+            return ""
+    except ValueError:
+        return ""
+    return normalized_file
 
 
 @st.dialog(
@@ -1425,11 +1455,23 @@ def _render_task_files_dialog(task_path):
         st.info(tr("No Task Files"))
     else:
         for file in files:
-            name_col, size_col, download_col = st.columns(
-                [5, 1, 1.4], vertical_alignment="center"
+            name_col, size_col, view_col, download_col = st.columns(
+                [4.4, 1, 1, 1.4], vertical_alignment="center"
             )
             name_col.code(file["name"], language="text")
             size_col.caption(_format_file_size(file["size"]))
+            preview_kind = _task_file_preview_kind(file["path"])
+            if preview_kind and view_col.button(
+                tr("View"),
+                key=(
+                    "view_task_file_"
+                    f"{hashlib.sha256(file['path'].encode('utf-8')).hexdigest()[:16]}"
+                ),
+                icon=":material/visibility:",
+                help=tr("View"),
+                use_container_width=True,
+            ):
+                st.session_state["task_file_preview_path"] = file["path"]
             try:
                 with open(file["path"], "rb") as artifact:
                     download_col.download_button(
@@ -1451,6 +1493,37 @@ def _render_task_files_dialog(task_path):
                     f"failed to read task file for download: {file['path']}, {e}"
                 )
                 download_col.caption(tr("File Unavailable"))
+
+    preview_path = _resolve_task_file_for_preview(
+        task_path,
+        st.session_state.get("task_file_preview_path", ""),
+    )
+    if preview_path:
+        st.divider()
+        preview_header, preview_close = st.columns([5, 1], vertical_alignment="center")
+        preview_header.caption(os.path.basename(preview_path))
+        if preview_close.button(
+            tr("Close"),
+            key="close_task_file_preview",
+            icon=":material/close:",
+            use_container_width=True,
+        ):
+            st.session_state.pop("task_file_preview_path", None)
+            st.rerun()
+        preview_kind = _task_file_preview_kind(preview_path)
+        if preview_kind == "image":
+            st.image(preview_path, use_container_width=True)
+        elif preview_kind == "video":
+            st.video(preview_path)
+        elif preview_kind == "audio":
+            st.audio(preview_path)
+        elif preview_kind == "text":
+            try:
+                with open(preview_path, "r", encoding="utf-8", errors="replace") as text_file:
+                    st.code(text_file.read(200_000), language="text")
+            except OSError as exc:
+                logger.warning(f"failed to read task file for preview: {preview_path}, {exc}")
+                st.caption(tr("File Unavailable"))
 
     if is_truncated:
         st.warning(tr("Task Files Truncated"))
@@ -2344,8 +2417,9 @@ def _render_generation_task_snapshot(task_id, task):
 
     state = _normalize_task_state(task.get("state"))
     progress = max(0, min(100, int(task.get("progress", 0) or 0)))
+    image_generation_only = bool(task.get("image_generation_only"))
     if state == const.TASK_STATE_PROCESSING:
-        st.info(tr("Generating Video"))
+        st.info(tr("Generating Images" if image_generation_only else "Generating Video"))
         st.progress(
             progress,
             text=f"{tr('Task Progress')}: {progress}%",
@@ -2355,9 +2429,47 @@ def _render_generation_task_snapshot(task_id, task):
 
     if state == const.TASK_STATE_FAILED:
         error = str(task.get("error") or "").strip()
-        message = tr("Video Generation Failed")
+        message = tr("Image Generation Failed" if image_generation_only else "Video Generation Failed")
         st.error(f"{message}: {error}" if error else message)
         _render_generation_logs(task_id)
+        return
+
+    image_files = task.get("images") or []
+    if state == const.TASK_STATE_COMPLETE and image_files:
+        st.success(tr("Image Generation Completed"))
+        try:
+            image_cols = st.columns(min(len(image_files), 4))
+            for i, image_path in enumerate(image_files):
+                with image_cols[i % len(image_cols)]:
+                    st.image(image_path)
+                    if not os.path.isfile(image_path):
+                        logger.warning(
+                            f"generated image is unavailable for download: "
+                            f"task_id={task_id}, image_file={image_path}"
+                        )
+                        continue
+                    with open(image_path, "rb") as image_file:
+                        st.download_button(
+                            f"{tr('Download Image')} {i + 1}",
+                            data=image_file,
+                            file_name=os.path.basename(image_path),
+                            mime="image/png",
+                            key=f"download_generated_image_{task_id}_{i}",
+                            icon=":material/download:",
+                            on_click="ignore",
+                            use_container_width=True,
+                        )
+        except Exception as exc:
+            logger.exception(
+                f"failed to render generated images: task_id={task_id}, "
+                f"image_files={image_files}, error={exc}"
+            )
+        _render_generation_logs(task_id)
+        if st.session_state.get("handled_generation_task_id") != task_id:
+            st.session_state["handled_generation_task_id"] = task_id
+            if config.ui.get("open_task_folder_on_completion", True):
+                open_task_folder(task_id)
+            logger.info(f"{tr('Image Generation Completed')}: task_id={task_id}")
         return
 
     video_files = task.get("videos") or []
@@ -7746,22 +7858,45 @@ def _render_generation_controls(
 
     _render_settings_transfer(params)
 
-    start_button = st.button(
-        tr("Generate Video"),
-        use_container_width=True,
-        type="primary",
-        key="generate_video_button",
-        on_click=_prepare_generation_task,
-    )
+    if params.video_source == "openai_image":
+        generation_columns = st.columns(2)
+        start_button = generation_columns[0].button(
+            tr("Generate Video"),
+            use_container_width=True,
+            type="primary",
+            key="generate_video_button",
+            on_click=_prepare_generation_task,
+            args=("video",),
+        )
+        image_only_button = generation_columns[1].button(
+            tr("Generate Images Only"),
+            use_container_width=True,
+            type="secondary",
+            key="generate_images_only_button",
+            on_click=_prepare_generation_task,
+            args=("images",),
+        )
+    else:
+        start_button = st.button(
+            tr("Generate Video"),
+            use_container_width=True,
+            type="primary",
+            key="generate_video_button",
+            on_click=_prepare_generation_task,
+            args=("video",),
+        )
+        image_only_button = False
     continue_generation = bool(
         st.session_state.pop("continue_generation_after_restore", False)
     )
     render_onboarding_tour()
-    if start_button or continue_generation:
+    pending_mode = st.session_state.pop("pending_generation_mode", "video")
+    image_only = bool(image_only_button or pending_mode == "images")
+    if start_button or image_only_button or continue_generation:
         _save_runtime_config()
         task_id = (
             st.session_state.get("pending_generation_task_id")
-            if start_button
+            if start_button or image_only_button
             else str(uuid4())
         ) or str(uuid4())
         _add_active_generation_task(
@@ -7788,6 +7923,50 @@ def _render_generation_controls(
             _remove_active_generation_task(task_id)
             st.error(tr("Please Select a Valid Video Source"))
             st.stop()
+
+        if image_only:
+            if params.video_source != "openai_image":
+                _remove_active_generation_task(task_id)
+                st.error(tr("Generate Images Only Requires OpenAI Image"))
+                st.stop()
+            if not str(params.video_script or "").strip():
+                _remove_active_generation_task(task_id)
+                st.error(tr("Segmented Script Required For Images"))
+                st.stop()
+
+            validate_image_config = getattr(
+                material, "get_openai_image_configuration_error", None
+            )
+            app_config_snapshot = config.snapshot_config_with_pending(config.app)
+            openai_image_config_error = (
+                validate_image_config(app_config_snapshot)
+                if callable(validate_image_config)
+                else None
+            )
+            if openai_image_config_error:
+                _remove_active_generation_task(task_id)
+                st.error(openai_image_config_error)
+                st.stop()
+
+            try:
+                st.toast(tr("Generating Images"))
+                logger.info(tr("Generate Images Only"))
+                logger.info(utils.to_json(params))
+                webui_task.submit_generation(
+                    task_id=task_id,
+                    params=params,
+                    stop_at="images",
+                    capture_logs=not config.ui.get("hide_log", False),
+                )
+            except Exception:
+                _remove_active_generation_task(task_id)
+                st.error(tr("Image Generation Failed"))
+                st.stop()
+
+            st.session_state["current_generation_task_id"] = task_id
+            logger.info(f"WebUI image-only task submitted: task_id={task_id}")
+            _render_current_generation_task()
+            return True
 
         if params.video_source == "pexels" and not config.app.get(
             "pexels_api_keys", ""

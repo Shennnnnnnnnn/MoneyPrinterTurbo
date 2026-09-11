@@ -115,6 +115,14 @@ ENGLISH_FALLBACK_KEYS = frozenset(
         "Packaging Task Files",
         "Task File Packaging Failed",
         "Download ZIP",
+        "View",
+        "Generate Images Only",
+        "Generate Images Only Requires OpenAI Image",
+        "Segmented Script Required For Images",
+        "Generating Images",
+        "Image Generation Failed",
+        "Image Generation Completed",
+        "Download Image",
     }
 )
 FORMAT_PLACEHOLDER_PATTERN = re.compile(r"(?<!\{)\{([a-zA-Z_][a-zA-Z0-9_]*)\}(?!\})")

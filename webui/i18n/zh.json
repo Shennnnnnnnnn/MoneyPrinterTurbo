@@ -93,6 +93,7 @@
     "Play": "播放",
     "Close": "关闭",
     "Open": "打开",
+    "View": "查看",
     "Delete": "删除",
     "Delete Task": "删除任务",
     "Task Deleted": "任务已删除",
@@ -543,6 +544,13 @@
     "OFox Upstream Vendor Help": "OFox 视频生成使用的上游厂商。BytePlus（国际）为默认值，内容政策一致；火山引擎为大陆厂商；自动分发由 OFox 网关按权重在可用厂商间调度。",
     "OFox Vendor BytePlus": "BytePlus（国际，默认）",
     "OFox Vendor Volcengine": "火山引擎（中国大陆）",
-    "OFox Vendor Auto": "自动分发（网关调度）"
+    "OFox Vendor Auto": "自动分发（网关调度）",
+    "Generate Images Only": "只生成图片",
+    "Generate Images Only Requires OpenAI Image": "“只生成图片”仅支持 OpenAI 兼容文生图来源。",
+    "Segmented Script Required For Images": "只生成图片需要先填写已用空行分段的视频文案。",
+    "Generating Images": "正在生成图片，请稍候...",
+    "Image Generation Failed": "图片生成失败",
+    "Image Generation Completed": "图片生成完成",
+    "Download Image": "下载图片"
   }
 }

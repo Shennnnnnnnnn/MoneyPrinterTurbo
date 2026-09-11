@@ -1279,6 +1279,42 @@ class TestTaskService(unittest.TestCase):
                 self.assertEqual(result, expected)
                 generate_final.assert_not_called()
 
+    def test_start_images_only_generates_images_without_running_video_pipeline(self):
+        params = VideoParams(
+            video_subject="Image-only task",
+            video_script="First paragraph.\n\nSecond paragraph.",
+            video_source="openai_image",
+        )
+        state = MemoryState()
+        with (
+            patch.object(tm.task_artifacts, "write_script_data"),
+            patch.object(tm.task_artifacts, "patch_script_data"),
+            patch.object(tm, "record_task_status"),
+            patch.object(
+                tm.material,
+                "get_openai_image_configuration_error",
+                return_value=None,
+            ),
+            patch.object(
+                tm.material,
+                "generate_openai_images_for_script_paragraphs",
+                return_value=["1-first.png", "2-second.png"],
+            ) as generate_images,
+            patch.object(tm, "_run_pipeline") as run_pipeline,
+            patch.object(tm.sm, "state", state),
+        ):
+            result = tm.start("images-only-task", params, stop_at="images")
+
+        self.assertEqual(result["images"], ["1-first.png", "2-second.png"])
+        self.assertTrue(result["image_generation_only"])
+        generate_images.assert_called_once_with(
+            task_id="images-only-task",
+            paragraphs=["First paragraph.", "Second paragraph."],
+            video_aspect=params.video_aspect,
+            material_directory=tm.utils.task_dir("images-only-task"),
+        )
+        run_pipeline.assert_not_called()
+
     def test_start_forwards_trusted_server_file_flag_to_audio_stage(self):
         params = VideoParams(video_subject="CLI custom audio")
 

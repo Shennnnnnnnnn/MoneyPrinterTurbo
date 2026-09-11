@@ -93,6 +93,7 @@
     "Play": "Play",
     "Close": "Close",
     "Open": "Open",
+    "View": "View",
     "Delete": "Delete",
     "Delete Task": "Delete Task",
     "Task Deleted": "Task deleted",
@@ -543,6 +544,13 @@
     "OFox Upstream Vendor Help": "Which upstream vendor serves OFox video generation. BytePlus (international) is the default with a consistent content policy; Volcano Engine is the mainland-China vendor; Auto lets the OFox gateway load-balance across vendors.",
     "OFox Vendor BytePlus": "BytePlus (International, default)",
     "OFox Vendor Volcengine": "Volcano Engine (Mainland China)",
-    "OFox Vendor Auto": "Auto (gateway load balancing)"
+    "OFox Vendor Auto": "Auto (gateway load balancing)",
+    "Generate Images Only": "Generate Images Only",
+    "Generate Images Only Requires OpenAI Image": "Generate Images Only requires the OpenAI-compatible image source.",
+    "Segmented Script Required For Images": "Enter a video script segmented with blank lines before generating images only.",
+    "Generating Images": "Generating images, please wait...",
+    "Image Generation Failed": "Image Generation Failed",
+    "Image Generation Completed": "Image Generation Completed",
+    "Download Image": "Download Image"
   }
 }

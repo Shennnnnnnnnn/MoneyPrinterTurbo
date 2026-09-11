@@ -22,6 +22,8 @@ TASK_HISTORY_HELPERS = {
     "_list_task_files",
     "_task_file_signature",
     "_build_task_file_archive",
+    "_task_file_preview_kind",
+    "_resolve_task_file_for_preview",
 }
 TASK_HISTORY_CONSTANTS = {
     "_FINAL_VIDEO_PATTERN",
@@ -56,6 +58,7 @@ def _load_task_history_helpers():
     namespace = {
         "json": __import__("json"),
         "hashlib": hashlib,
+        "mimetypes": __import__("mimetypes"),
         "logger": __import__("logging").getLogger(__name__),
         "os": os,
         "re": re,
@@ -82,6 +85,8 @@ get_unmet_restore_upload_requirements = TASK_HISTORY_NAMESPACE[
 safe_load_task_status = TASK_HISTORY_NAMESPACE["_safe_load_task_status"]
 list_task_files = TASK_HISTORY_NAMESPACE["_list_task_files"]
 build_task_file_archive = TASK_HISTORY_NAMESPACE["_build_task_file_archive"]
+task_file_preview_kind = TASK_HISTORY_NAMESPACE["_task_file_preview_kind"]
+resolve_task_file_for_preview = TASK_HISTORY_NAMESPACE["_resolve_task_file_for_preview"]
 
 
 def test_find_final_task_video_ignores_intermediate_files(tmp_path):
@@ -314,3 +319,27 @@ def test_task_file_archive_preserves_relative_paths(tmp_path):
             assert archive.read("subtitles/subtitle.srt") == b"subtitle"
     finally:
         os.remove(archive_path)
+
+
+def test_task_file_preview_supports_media_and_text_inside_task_directory(tmp_path):
+    tasks_root = tmp_path / "tasks"
+    task_dir = tasks_root / "completed-task"
+    task_dir.mkdir(parents=True)
+    image_file = task_dir / "1-image.png"
+    video_file = task_dir / "final-1.mp4"
+    text_file = task_dir / "script.json"
+    image_file.write_bytes(b"png")
+    video_file.write_bytes(b"video")
+    text_file.write_text("{}", encoding="utf-8")
+
+    TASK_HISTORY_NAMESPACE["utils"] = SimpleNamespace(
+        task_dir=lambda: str(tasks_root)
+    )
+
+    assert task_file_preview_kind(str(image_file)) == "image"
+    assert task_file_preview_kind(str(video_file)) == "video"
+    assert task_file_preview_kind(str(text_file)) == "text"
+    assert resolve_task_file_for_preview(str(task_dir), str(image_file)) == str(
+        image_file.resolve()
+    )
+    assert resolve_task_file_for_preview(str(task_dir), str(tmp_path / "outside.png")) == ""

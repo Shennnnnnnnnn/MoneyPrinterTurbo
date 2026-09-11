@@ -1401,6 +1401,77 @@ def _schedule_cross_post(
     return None
 
 
+def _run_image_generation_only(task_id: str, params: VideoParams) -> dict:
+    """Generate one image per pre-segmented paragraph without TTS or video work."""
+    if params.video_source != "openai_image":
+        return _mark_task_failed(
+            task_id,
+            "images",
+            "image-only generation requires the openai_image source",
+        )
+
+    configuration_error = material.get_openai_image_configuration_error(
+        config.snapshot_config_with_pending(config.app)
+    )
+    if configuration_error:
+        return _mark_task_failed(task_id, "preflight", configuration_error)
+
+    script = str(params.video_script or "").strip()
+    paragraphs = script_service.split_script_paragraphs(script)
+    if not script or not paragraphs:
+        return _mark_task_failed(
+            task_id,
+            "images",
+            "image-only generation requires a segmented video script",
+        )
+
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=10)
+    image_paths = material.generate_openai_images_for_script_paragraphs(
+        task_id=task_id,
+        paragraphs=paragraphs,
+        video_aspect=params.video_aspect,
+        material_directory=utils.task_dir(task_id),
+    )
+    if not image_paths:
+        return _mark_task_failed(
+            task_id,
+            "images",
+            "failed to generate paragraph images",
+        )
+
+    result = {
+        "images": image_paths,
+        "image_generation_only": True,
+        "script": script,
+        "script_paragraphs": paragraphs,
+        "materials": image_paths,
+    }
+    task_artifacts.patch_script_data(
+        task_id,
+        script=script,
+        script_paragraphs=paragraphs,
+        images=image_paths,
+        image_generation_only=True,
+    )
+    sm.state.update_task(
+        task_id,
+        state=const.TASK_STATE_COMPLETE,
+        progress=100,
+        **result,
+    )
+    record_task_status(
+        task_id,
+        state=const.TASK_STATE_COMPLETE,
+        progress=100,
+        image_generation_only=True,
+    )
+    logger.success(
+        f"image-only generation completed: task_id={task_id}, "
+        f"images={len(image_paths)}"
+    )
+    return result
+
+
 def _run_pipeline(
     task_id,
     params: VideoParams,
@@ -1792,6 +1863,8 @@ def start(
         video_subject=params.video_subject or params.video_script or task_id,
     )
     try:
+        if stop_at == "images":
+            return _run_image_generation_only(task_id, params)
         return _run_pipeline(
             task_id,
             params,

@@ -946,6 +946,32 @@ class TestOpenAIImageProvider(unittest.TestCase):
         render_static.assert_called_once_with("/tmp/generated.png", 3.5)
         render_zoom.assert_not_called()
 
+    def test_generate_openai_images_for_script_paragraphs_prefixes_segment_index(self):
+        def fake_generate(search_term, minimum_duration, video_aspect, save_dir=""):
+            image_path = os.path.join(save_dir, f"openai-image-{search_term}.png")
+            with open(image_path, "wb") as image_file:
+                image_file.write(b"image")
+            return [self._generated_item(search_term, image_path)]
+
+        with (
+            patch(
+                "app.services.material.generate_images_openai",
+                side_effect=fake_generate,
+            ),
+            patch("app.services.material._persist_material_sources"),
+        ):
+            result = material.generate_openai_images_for_script_paragraphs(
+                task_id="image-only-names",
+                paragraphs=["First", "Second"],
+                video_aspect=material.VideoAspect.portrait,
+                material_directory=self.save_dir,
+            )
+
+        self.assertEqual(
+            [os.path.basename(path) for path in result],
+            ["1-openai-image-First.png", "2-openai-image-Second.png"],
+        )
+
     def test_download_videos_openai_image_generates_paragraphs_concurrently(self):
         segments = [
             {"text": "First paragraph.", "start": 0.0, "end": 2.0, "duration": 2.0},
