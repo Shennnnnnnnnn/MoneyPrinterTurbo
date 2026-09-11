@@ -59,13 +59,13 @@ def test_headless_play_renders_and_closes_browser_preview(headless_task_app):
     assert len(app.get("video")) == 0
 
 
-def test_headless_open_folder_shows_host_mapped_path(headless_task_app):
-    app, _ = headless_task_app
+def test_headless_open_folder_renders_browser_task_file_view(headless_task_app):
+    app, video_file = headless_task_app
 
     _button_by_key_prefix(app, "open_task_all_headless-test").click()
     app.run()
 
     assert not app.exception
-    assert any(
-        "./storage/tasks/headless-test" in toast.value for toast in app.get("toast")
+    assert app.session_state["task_files_dialog_path"] == str(
+        video_file.parent.resolve()
     )

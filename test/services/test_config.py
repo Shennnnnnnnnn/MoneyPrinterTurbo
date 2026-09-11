@@ -60,6 +60,7 @@ class TestConfigPersistence:
         assert app_config["metaso_minimax_api_key"] == ""
         assert app_config["metaso_minimax_base_url"].startswith("https://")
         assert app_config["metaso_minimax_resolution"] in {"768P", "2K"}
+        assert app_config["openai_image_parallelism"] == 3
         assert "loomloom_market_listing_id" not in app_config
         assert "loomloom_video_market_listing_id" not in app_config
         assert app_config["shengsuanyun_api_key"] == ""

@@ -4,7 +4,7 @@ from uuid import uuid4
 
 from fastapi import Header, Request
 
-from app.config import config
+from app import auth
 from app.models.exception import HttpException
 
 MAX_TASK_ID_LENGTH = 128
@@ -55,7 +55,7 @@ def verify_token(
     个值。参数声明同时让 Swagger 展示该请求头，便于受保护环境调试。
     """
 
-    configured_key = config.app.get("api_key", "")
+    configured_key = auth.get_api_key()
     if configured_key in (None, ""):
         return None
 

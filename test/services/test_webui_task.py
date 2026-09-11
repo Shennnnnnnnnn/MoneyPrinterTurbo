@@ -451,7 +451,7 @@ def test_generation_submit_skips_duplicate_config_save():
     )
 
     assert isinstance(controls.body[-1], ast.Return)
-    assert ast.unparse(controls.body[-1].value) == "start_button"
+    assert ast.unparse(controls.body[-1].value) == "start_button or continue_generation"
 
     submitted_assignment = next(
         node

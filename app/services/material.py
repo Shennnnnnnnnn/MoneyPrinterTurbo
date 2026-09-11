@@ -6,6 +6,7 @@ import random
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, List
 from urllib.parse import quote_plus, urlencode, urlsplit, urlunsplit
@@ -1076,8 +1077,12 @@ OPENAI_IMAGE_DEFAULT_SIZES = {
     VideoAspect.landscape: "1536x1024",
     VideoAspect.square: "1024x1024",
 }
-# 与 WaveSpeed 保持同一重试口径：429 与 5xx 属于临时故障，做有限次退避重试。
-OPENAI_IMAGE_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+# 429、499、标准 5xx 和 Cloudflare 520-524 都按临时网关故障做有限次退避
+# 重试。499 常见于代理上游取消（例如 ``context canceled``）；错误页可能是
+# HTML，不能按 API JSON 解析，但不应因此把任务直接判死。
+OPENAI_IMAGE_RETRYABLE_STATUS_CODES = frozenset(
+    {429, 499, 500, 502, 503, 504, 520, 521, 522, 523, 524}
+)
 # 401/403 是当前 key 被明确拒绝。get_api_key 每次调用轮换 key，配置了多个
 # key 时重试会自动换 key；只有一个 key 时快速失败，不做无意义重试。
 OPENAI_IMAGE_KEY_ERROR_STATUS_CODES = frozenset({401, 403})
@@ -1089,6 +1094,11 @@ OPENAI_IMAGE_REQUEST_TIMEOUT = (30, 300)
 # 图片已按张计费后的下载重试：优先重试原地址，而不是重新生成同一张图。
 OPENAI_IMAGE_MAX_DOWNLOAD_ATTEMPTS = 3
 OPENAI_IMAGE_DOWNLOAD_BACKOFF_SECONDS = 2
+# Script paragraphs are independent image-generation requests. Keep concurrency
+# bounded so cloud endpoints do not receive an unbounded burst and local GPU
+# gateways can opt back down to one worker.
+OPENAI_IMAGE_DEFAULT_PARALLELISM = 3
+OPENAI_IMAGE_MAX_PARALLELISM = 8
 
 
 def is_openai_image_enabled(app_config: dict | None = None) -> bool:
@@ -1099,11 +1109,35 @@ def is_openai_image_enabled(app_config: dict | None = None) -> bool:
     请求不带 Authorization 头。供任务预检和 WebUI 在消耗 LLM、TTS 额度
     前拦截缺失配置的任务。
     """
+    return get_openai_image_configuration_error(app_config) is None
+
+
+def get_openai_image_configuration_error(
+    app_config: dict | None = None,
+) -> str | None:
+    """Return a human-readable configuration error, if one is present."""
     app_config = config.app if app_config is None else app_config
-    return bool(
-        str(app_config.get("openai_image_base_url", "") or "").strip()
-        and str(app_config.get("openai_image_model", "") or "").strip()
+    base_url = str(app_config.get("openai_image_base_url", "") or "").strip()
+    model = str(app_config.get("openai_image_model", "") or "").strip()
+    if not base_url:
+        return "OpenAI image source requires openai_image_base_url in config.toml"
+    if not model:
+        return "OpenAI image source requires openai_image_model in config.toml"
+
+    return None
+
+
+def get_openai_image_parallelism(app_config: dict | None = None) -> int:
+    """Return the bounded number of concurrent paragraph image requests."""
+    app_config = config.app if app_config is None else app_config
+    configured = app_config.get(
+        "openai_image_parallelism", OPENAI_IMAGE_DEFAULT_PARALLELISM
     )
+    try:
+        parallelism = int(configured)
+    except (TypeError, ValueError):
+        parallelism = OPENAI_IMAGE_DEFAULT_PARALLELISM
+    return max(1, min(parallelism, OPENAI_IMAGE_MAX_PARALLELISM))
 
 
 def _openai_image_endpoint() -> tuple[str, str]:
@@ -1114,6 +1148,7 @@ def _openai_image_endpoint() -> tuple[str, str]:
         str(config.app.get("openai_image_base_url", "") or "").strip().rstrip("/")
     )
     model = str(config.app.get("openai_image_model", "") or "").strip()
+    configuration_error = get_openai_image_configuration_error()
     if not base_url:
         raise ValueError(
             "\n\n##### openai_image_base_url is not set #####\n\n"
@@ -1124,6 +1159,8 @@ def _openai_image_endpoint() -> tuple[str, str]:
             "\n\n##### openai_image_model is not set #####\n\n"
             f"Please set it in the config.toml file: {config.config_file}\n"
         )
+    if configuration_error:
+        raise ValueError(f"\n\n##### {configuration_error} #####\n\n")
     return f"{base_url}/{OPENAI_IMAGE_ENDPOINT_PATH}", model
 
 
@@ -1562,6 +1599,174 @@ def _download_videos_openai_image_on_demand(
     return video_paths
 
 
+def _download_openai_images_for_script_segments(
+    *,
+    task_id: str,
+    script_segments: list[dict[str, Any]],
+    video_aspect: VideoAspect,
+    material_directory: str,
+    clip_speed: float,
+) -> List[str]:
+    """Generate exactly one timed image clip for every script paragraph."""
+    if not material_directory:
+        material_directory = utils.task_dir(task_id)
+
+    normalized_speed = utils.normalize_clip_speed(clip_speed)
+    prepared_segments: list[tuple[int, dict[str, Any], str, float, int, float]] = []
+    for expected_index, segment in enumerate(script_segments, start=1):
+        text = str(segment.get("text") or "").strip()
+        try:
+            duration = float(segment.get("duration"))
+        except (TypeError, ValueError):
+            duration = 0.0
+        if not text or not math.isfinite(duration) or duration <= 0:
+            logger.error(
+                "invalid script segment for image generation: "
+                f"index={expected_index}, duration={segment.get('duration')!r}"
+            )
+            return []
+
+        # combine_videos applies the configured visual playback speed before
+        # trimming to the narration duration. Render enough source frames for
+        # fast playback and add one frame of headroom for encoder rounding.
+        source_duration = duration * normalized_speed + (1 / 30)
+        prepared_segments.append(
+            (
+                expected_index,
+                segment,
+                text,
+                source_duration,
+                max(math.ceil(source_duration), 1),
+                duration,
+            )
+        )
+
+    parallelism = min(get_openai_image_parallelism(), len(prepared_segments))
+    total_segments = len(prepared_segments)
+    logger.info(
+        "generating paragraph images with bounded concurrency: "
+        f"progress=0/{total_segments}, segments={total_segments}, "
+        f"parallelism={parallelism}"
+    )
+    generated_items: dict[int, MaterialInfo] = {}
+    failed_index: int | None = None
+    completed_segments = 0
+
+    # MoviePy/ffmpeg encoding is CPU and disk intensive. Keep it ordered below
+    # while overlapping only the independent, remote image-generation requests.
+    with ThreadPoolExecutor(
+        max_workers=parallelism,
+        thread_name_prefix="mpt-openai-image",
+    ) as executor:
+        segment_iterator = iter(prepared_segments)
+        futures = {}
+
+        def submit_next_segment() -> bool:
+            try:
+                expected_index, _, text, _, minimum_duration, _ = next(
+                    segment_iterator
+                )
+            except StopIteration:
+                return False
+            future = executor.submit(
+                generate_images_openai,
+                search_term=text,
+                minimum_duration=minimum_duration,
+                video_aspect=video_aspect,
+                save_dir=material_directory,
+            )
+            futures[future] = expected_index
+            return True
+
+        for _ in range(parallelism):
+            if not submit_next_segment():
+                break
+
+        while futures:
+            future = next(as_completed(futures))
+            expected_index = futures.pop(future)
+            try:
+                items = future.result()
+            except Exception as exc:
+                logger.error(
+                    "paragraph image generation failed: "
+                    f"progress={completed_segments}/{total_segments}, "
+                    f"index={expected_index}, error={type(exc).__name__}: {exc}"
+                )
+                for pending_future in futures:
+                    pending_future.cancel()
+                raise
+            if len(items) != 1:
+                failed_index = expected_index
+                logger.error(
+                    "paragraph image generation failed: "
+                    f"progress={completed_segments}/{total_segments}, "
+                    f"index={expected_index}, images={len(items)}"
+                )
+                for pending_future in futures:
+                    pending_future.cancel()
+                break
+            generated_items[expected_index] = items[0]
+            completed_segments += 1
+            logger.info(
+                "paragraph image generation progress: "
+                f"progress={completed_segments}/{total_segments}, "
+                f"index={expected_index}"
+            )
+            submit_next_segment()
+
+    if failed_index is not None:
+        logger.error(
+            "failed to generate the required paragraph image: "
+            f"index={failed_index}"
+        )
+        return []
+
+    video_paths: List[str] = []
+    material_sources: list[dict[str, Any]] = []
+    for (
+        expected_index,
+        segment,
+        text,
+        source_duration,
+        _,
+        duration,
+    ) in prepared_segments:
+        item = generated_items[expected_index]
+        video_file = _render_openai_image_video(item.url, source_duration)
+        if not video_file:
+            logger.error(
+                "failed to render the required paragraph image: "
+                f"index={expected_index}"
+            )
+            return []
+
+        video_paths.append(video_file)
+        try:
+            source_record = _material_source_record(item, video_file)
+            source_record.update(
+                {
+                    "script_segment_index": expected_index,
+                    "script_start": float(segment.get("start", 0.0)),
+                    "script_end": float(segment.get("end", duration)),
+                    "script_text": text,
+                }
+            )
+            material_sources.append(source_record)
+        except Exception as source_error:
+            logger.warning(
+                "failed to prepare paragraph image source record: "
+                f"index={expected_index}, error={type(source_error).__name__}, "
+                f"detail={source_error}"
+            )
+
+    logger.success(
+        f"generated and rendered {len(video_paths)} paragraph image materials"
+    )
+    _persist_material_sources(task_id, material_sources)
+    return video_paths
+
+
 def _search_videos_with_cache(
     provider: str,
     search_videos: Callable[..., List[MaterialInfo]],
@@ -1664,6 +1869,8 @@ def download_videos(
     audio_duration: float = 0.0,
     max_clip_duration: int = 5,
     match_script_order: bool = False,
+    script_segments: list[dict[str, Any]] | None = None,
+    clip_speed: float = 1.0,
 ) -> List[str]:
     provider = "pexels"
     remote_search_videos = search_videos_pexels
@@ -1742,6 +1949,14 @@ def download_videos(
             material_directory=material_directory,
         )
     if source == "openai_image":
+        if script_segments:
+            return _download_openai_images_for_script_segments(
+                task_id=task_id,
+                script_segments=script_segments,
+                video_aspect=video_aspect,
+                material_directory=material_directory,
+                clip_speed=clip_speed,
+            )
         # 与 WaveSpeed 相同的按需付费语义：文生图按张计费，逐段生成、凑够
         # 所需时长立即停止。生成结果是一次性的本地图片文件，也不参与 24
         # 小时搜索缓存——缓存会让不同任务反复拿到同一张图。

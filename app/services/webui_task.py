@@ -104,6 +104,13 @@ def _run_generation(
             failed_stage=failure["failed_stage"],
             error=failure["error"],
         )
+        tm.record_task_status(
+            task_id,
+            state=failure["state"],
+            progress=failure["progress"],
+            failed_stage=failure["failed_stage"],
+            error=failure["error"],
+        )
         logger.exception(
             f"unexpected WebUI generation worker failure, "
             f"task_id={task_id}, error={exc}"
@@ -145,6 +152,12 @@ def submit_generation(
         progress=0,
         video_subject=task_params.video_subject or task_params.video_script or task_id,
     )
+    tm.record_task_status(
+        task_id,
+        state=const.TASK_STATE_PROCESSING,
+        progress=0,
+        video_subject=task_params.video_subject or task_params.video_script or task_id,
+    )
     try:
         _task_manager.add_task(
             _run_generation,
@@ -159,6 +172,13 @@ def submit_generation(
         # “生成中”。保留异常类型便于从 Docker 或本机日志快速定位队列问题。
         error = f"{type(exc).__name__}: {exc}"
         sm.state.update_task(
+            task_id,
+            state=const.TASK_STATE_FAILED,
+            progress=0,
+            failed_stage="scheduling",
+            error=error,
+        )
+        tm.record_task_status(
             task_id,
             state=const.TASK_STATE_FAILED,
             progress=0,

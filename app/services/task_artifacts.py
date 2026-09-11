@@ -18,6 +18,11 @@ def _script_file(task_id: str) -> Path:
     return Path(utils.task_dir(task_id)) / "script.json"
 
 
+def _status_file(task_id: str) -> Path:
+    """Return the durable, user-visible status record for one task."""
+    return Path(utils.task_dir(task_id)) / "task-status.json"
+
+
 def _write_json_atomic(target: Path, payload: Mapping[str, Any]) -> None:
     """
     在目标目录内原子写入 JSON，避免进程中断留下半个文件。
@@ -59,6 +64,19 @@ def _write_json_atomic(target: Path, payload: Mapping[str, Any]) -> None:
 def write_script_data(task_id: str, payload: Mapping[str, Any]) -> None:
     """创建或完整替换任务的 ``script.json`` 清单。"""
     _write_json_atomic(_script_file(task_id), payload)
+
+
+def write_task_status(task_id: str, payload: Mapping[str, Any]) -> bool:
+    """Persist a task lifecycle snapshot without interrupting the pipeline."""
+    try:
+        _write_json_atomic(_status_file(task_id), payload)
+        return True
+    except Exception as exc:
+        logger.warning(
+            "failed to write task status record: "
+            f"task_id={task_id}, error={type(exc).__name__}, detail={exc}"
+        )
+        return False
 
 
 def patch_script_data(task_id: str, **updates: Any) -> bool:

@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
+from app import auth
 from app.config import config
 from app.controllers import base
 from app.models.exception import HttpException
@@ -23,7 +24,7 @@ async def application_lifespan(_: FastAPI):
     """集中处理 API 进程启动恢复和关闭日志。"""
     logger.info("startup event")
 
-    configured_api_key = config.app.get("api_key", "")
+    configured_api_key = auth.get_api_key()
     if configured_api_key in (None, ""):
         logger.warning(
             "API key authentication is disabled; keep the API on a trusted network"
@@ -90,7 +91,7 @@ def configure_cors(instance: FastAPI, allowed_origins: list[str]) -> None:
         return
 
     allow_all_origins = "*" in allowed_origins
-    configured_api_key = config.app.get("api_key", "")
+    configured_api_key = auth.get_api_key()
     if allow_all_origins and configured_api_key in (None, ""):
         # ``*`` 是用户显式选择的兼容模式，因此不强制拒绝启动；但在免认证
         # 状态下它会允许任意网页读取和调用 API，必须留下可定位的安全告警。
@@ -188,17 +189,16 @@ app = get_application()
 
 
 @app.middleware("http")
-async def protect_generated_task_files(request: Request, call_next):
-    """保护任务产物静态路由，防止绕过 API 鉴权直接下载。
+async def protect_http_requests(request: Request, call_next):
+    """Apply the configured API credential to every HTTP route.
 
-    ``/tasks`` 由 StaticFiles 独立挂载，无法复用 APIRouter 的依赖，
-    因此在中间件中调用同一个 verify_token。鉴权函数会在未配置
-    api_key 时放行；OPTIONS 预检请求也保留给 CORS 中间件处理。
+    Router dependencies cannot protect FastAPI's docs or mounted static files.
+    A process-level password therefore guards every normal request, while CORS
+    preflight remains credential-free because browsers cannot attach headers to
+    it and it has no application side effect.
     """
 
-    request_path = request.url.path
-    is_task_file = request_path == "/tasks" or request_path.startswith("/tasks/")
-    if is_task_file and request.method != "OPTIONS":
+    if request.method != "OPTIONS":
         try:
             base.verify_token(request)
         except HttpException as exception:

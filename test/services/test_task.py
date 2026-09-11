@@ -119,6 +119,41 @@ class TestTaskService(unittest.TestCase):
             params.video_fit_mode,
         )
 
+    def test_generate_final_videos_uses_paragraph_durations_for_images(self):
+        params = VideoParams(
+            video_subject="test",
+            video_source="openai_image",
+            video_concat_mode="random",
+        )
+        segments = [
+            {"text": "First.", "duration": 2.25},
+            {"text": "Second.", "duration": 3.75},
+        ]
+
+        with (
+            patch.object(tm.video, "combine_videos") as combine_videos,
+            patch.object(tm.video, "generate_video"),
+            patch.object(tm.sm.state, "update_task"),
+        ):
+            tm.generate_final_videos(
+                task_id="paragraph-video-task",
+                params=params,
+                downloaded_videos=["first.mp4", "second.mp4"],
+                audio_file="audio.mp3",
+                subtitle_path="",
+                audio_duration=6,
+                script_segments=segments,
+            )
+
+        self.assertEqual(
+            combine_videos.call_args.kwargs["video_concat_mode"],
+            tm.VideoConcatMode.sequential,
+        )
+        self.assertEqual(
+            combine_videos.call_args.kwargs["clip_durations"],
+            [2.25, 3.75],
+        )
+
     def test_generate_final_videos_uses_generated_sonilo_music(self):
         """Sonilo 必须针对每条拼接后的视频生成配乐，并传给最终混音。"""
         params = VideoParams(
@@ -562,6 +597,28 @@ class TestTaskService(unittest.TestCase):
 
         self.assertEqual(result["error"], "remote run timed out")
         self.assertEqual(result["loomloom_run_id"], "run-1")
+
+    def test_mark_task_failed_persists_history_status(self):
+        state = MemoryState()
+        state.update_task("history-failure", state=tm.const.TASK_STATE_PROCESSING, progress=40)
+
+        with (
+            patch.object(tm.sm, "state", state),
+            patch.object(tm.task_artifacts, "write_task_status", return_value=True) as write,
+        ):
+            tm._mark_task_failed(
+                "history-failure",
+                "materials",
+                "failed to prepare video materials",
+            )
+
+        task_id, payload = write.call_args.args
+        self.assertEqual(task_id, "history-failure")
+        self.assertEqual(payload["state"], tm.const.TASK_STATE_FAILED)
+        self.assertEqual(payload["progress"], 40)
+        self.assertEqual(payload["failed_stage"], "materials")
+        self.assertEqual(payload["error"], "failed to prepare video materials")
+        self.assertIsInstance(payload["updated_at"], float)
 
     def test_start_rejects_missing_elevenlabs_key_before_pipeline_steps(self):
         """完整任务缺少 ElevenLabs Key 时必须在任何付费步骤前失败。"""

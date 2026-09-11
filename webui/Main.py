@@ -8,8 +8,10 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import webbrowser
+import zipfile
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +29,7 @@ if root_dir in sys.path:
     sys.path.remove(root_dir)
 sys.path.insert(0, root_dir)
 
+from app import auth
 from app.config import config
 from app.models import const
 from app.models.llm_provider import (
@@ -51,6 +54,7 @@ from app.services import (
     material,
     metaso_minimax,
     ofox,
+    script as script_service,
     video,
     volcengine_seedance,
     voice,
@@ -102,10 +106,13 @@ DEFAULT_KOKORO_MODEL = "kokoro"
 # empty = ask the server for its voice list (GET {base_url}/audio/voices)
 DEFAULT_KOKORO_VOICES: list[str] = []
 ONBOARDING_TOUR_KEY = "mpt-onboarding-v1"
+ONBOARDING_TOUR_COMPLETED_KEY = f"{ONBOARDING_TOUR_KEY}-completed"
 CUSTOM_LLM_ENDPOINT_ID = "custom"
 VOICE_MODE_TTS = "tts"
 VOICE_MODE_UPLOAD = "upload"
 VOICE_MODE_NONE = "none"
+TASK_STATUS_FILENAME = "task-status.json"
+TASK_FILE_VIEW_LIMIT = 100
 LOOMLOOM_MAX_POLL_FAILURES = 5
 # WebUI 按素材能力分组展示视频来源，但底层仍保存原有 video_source 值。
 # AI 视频组与设置页共用同一业务顺序：合作服务商优先，并按秘塔、胜算云、
@@ -392,6 +399,25 @@ def _saved_ui_text(key, default="", max_length=None):
     return value
 
 
+def _get_openai_image_parallelism_settings() -> tuple[int, int]:
+    """Read image concurrency while tolerating a stale hot-reloaded service."""
+    maximum = getattr(material, "OPENAI_IMAGE_MAX_PARALLELISM", 8)
+    try:
+        maximum = max(1, int(maximum))
+    except (TypeError, ValueError):
+        maximum = 8
+
+    get_parallelism = getattr(material, "get_openai_image_parallelism", None)
+    if callable(get_parallelism):
+        return int(get_parallelism()), maximum
+
+    try:
+        configured = int(config.app.get("openai_image_parallelism", 3) or 3)
+    except (TypeError, ValueError):
+        configured = 3
+    return max(1, min(configured, maximum)), maximum
+
+
 def _run_llm_read_operation(operation_name, operation):
     """
     使用稳定的当前 LLM 配置执行只读请求，并避免等待视频生成任务。
@@ -596,13 +622,6 @@ def _build_uploaded_file_path(uploaded_file, target_dir, allowed_extensions, pre
 
 def _initialize_session_state():
     """集中初始化跨 rerun 保留的页面状态。"""
-    if not st.session_state.get("cross_post_recovery_checked"):
-        # WebUI 可以不经过 FastAPI 独立运行，因此也需要在首次会话初始化时处理
-        # 进程重启留下的发布状态。恢复失败时不写标记，后续 rerun 会再次尝试。
-        recovered = tm.recover_interrupted_cross_posts()
-        if recovered is not None:
-            st.session_state["cross_post_recovery_checked"] = True
-
     saved_ui_language = config.ui.get("language", "")
     browser_locale = st.context.locale
     initial_ui_language = utils.resolve_ui_language(
@@ -708,9 +727,21 @@ def _initialize_session_state():
             loomloom.MAX_VIDEO_SCENES,
             int,
         ),
+        "webui_authenticated": False,
+        "webui_remember_login": False,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
+
+    if auth.get_webui_password() and not st.session_state["webui_authenticated"]:
+        return
+
+    if not st.session_state.get("cross_post_recovery_checked"):
+        # WebUI 可以不经过 FastAPI 独立运行，因此也需要在首次会话初始化时处理
+        # 进程重启留下的发布状态。恢复失败时不写标记，后续 rerun 会再次尝试。
+        recovered = tm.recover_interrupted_cross_posts()
+        if recovered is not None:
+            st.session_state["cross_post_recovery_checked"] = True
 
 
 _initialize_session_state()
@@ -724,6 +755,115 @@ def tr(key):
     # 新功能优先维护中英文。其它语言缺少单项翻译时统一回退英文，避免在多个
     # locale 中复制相同英文后长期失去同步；英文也没有该键时才显示原始 key。
     return locales.get("en", {}).get("Translation", {}).get(key, key)
+
+
+_REMEMBER_LOGIN_COMPONENT = st.components.v2.component(
+    "mpt_remember_login",
+    html="<span hidden></span>",
+    js="""
+        export default function(component) {
+            const { data, setTriggerValue } = component;
+            const readCookie = (name) => {
+                const prefix = `${name}=`;
+                for (const item of document.cookie.split(";")) {
+                    const cookie = item.trim();
+                    if (cookie.startsWith(prefix)) {
+                        return cookie.slice(prefix.length);
+                    }
+                }
+                return "";
+            };
+            const cookieAttributes = `; Path=/; SameSite=Strict${window.location.protocol === "https:" ? "; Secure" : ""}`;
+
+            if (data.action === "write" && data.token) {
+                document.cookie = `${data.cookieName}=${data.token}; Max-Age=${data.maxAge}${cookieAttributes}`;
+            } else if (data.action === "clear") {
+                document.cookie = `${data.cookieName}=; Max-Age=0${cookieAttributes}`;
+            }
+
+            const token = readCookie(data.cookieName);
+            if (token !== data.knownToken) {
+                setTriggerValue("token", token);
+            }
+        }
+    """,
+)
+
+
+def _sync_remembered_webui_login():
+    """Synchronize a signed browser cookie with the current WebUI session."""
+
+    if not auth.get_webui_password():
+        return
+
+    action = st.session_state.get("webui_remember_cookie_action", "read")
+    token = st.session_state.get("webui_remember_cookie_token", "")
+    known_token = st.session_state.get("webui_remember_cookie_seen", "")
+    result = _REMEMBER_LOGIN_COMPONENT(
+        key="webui_remember_login_cookie",
+        data={
+            "action": action,
+            "cookieName": auth.REMEMBER_LOGIN_COOKIE_NAME,
+            "token": token,
+            "knownToken": known_token,
+            "maxAge": auth.REMEMBER_LOGIN_TTL_SECONDS,
+        },
+        on_token_change=lambda: None,
+        height=0,
+    )
+    browser_token = getattr(result, "token", None)
+    if not isinstance(browser_token, str) or browser_token == known_token:
+        return
+
+    st.session_state["webui_remember_cookie_seen"] = browser_token
+    st.session_state["webui_remember_cookie_action"] = "read"
+    st.session_state["webui_remember_cookie_token"] = ""
+    if (
+        not st.session_state["webui_authenticated"]
+        and auth.verify_remember_login_token(browser_token)
+    ):
+        st.session_state["webui_authenticated"] = True
+        st.rerun()
+
+
+def _require_webui_login():
+    """Render the login gate before any task or provider state is exposed."""
+
+    if not auth.get_webui_password() or st.session_state["webui_authenticated"]:
+        return
+
+    st.title("MoneyPrinterTurbo")
+    st.subheader(tr("Login Required"))
+    with st.container(border=True):
+        username = st.text_input(tr("Username"), key="webui_login_username")
+        password = st.text_input(
+            tr("Password"),
+            type="password",
+            key="webui_login_password",
+        )
+        remember_login = st.checkbox(
+            tr("Remember Login"),
+            key="webui_remember_login",
+        )
+        if st.button(
+            tr("Login"),
+            key="webui_login_submit",
+            type="primary",
+            use_container_width=True,
+        ):
+            if username == "admin" and auth.verify_webui_password(password):
+                st.session_state["webui_authenticated"] = True
+                st.session_state.pop("webui_login_password", None)
+                st.session_state["webui_remember_cookie_action"] = (
+                    "write" if remember_login else "clear"
+                )
+                st.session_state["webui_remember_cookie_token"] = (
+                    auth.create_remember_login_token() if remember_login else ""
+                )
+                st.rerun()
+            else:
+                st.error(tr("Invalid Username or Password"))
+    st.stop()
 
 
 # -----------------------------------------------------------------------------
@@ -754,6 +894,20 @@ def _safe_load_task_script(task_path):
             return json.load(f)
     except Exception as e:
         logger.warning(f"failed to read task script data: {script_file}, {e}")
+        return {}
+
+
+def _safe_load_task_status(task_path):
+    status_file = os.path.join(task_path, TASK_STATUS_FILENAME)
+    if not os.path.isfile(status_file):
+        return {}
+
+    try:
+        with open(status_file, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else {}
+    except Exception as e:
+        logger.warning(f"failed to read task status data: {status_file}, {e}")
         return {}
 
 
@@ -829,10 +983,11 @@ def _get_unmet_restore_upload_requirements(
     return unmet
 
 
-def _queue_task_restore(task_id):
+def _queue_task_restore(task_id, continue_generation=False):
     # 任务列表运行在 fragment 中，不能直接修改已经创建的主表单控件状态。
     # 这里只记录候选任务并触发整页 rerun，确认和参数恢复由主页面统一处理。
     st.session_state["task_restore_candidate_id"] = task_id
+    st.session_state["task_restore_continue_generation"] = bool(continue_generation)
     st.session_state["task_manager_popover_nonce"] = (
         st.session_state.get("task_manager_popover_nonce", 0) + 1
     )
@@ -944,20 +1099,33 @@ def _scan_history_tasks(limit=30):
     tasks = []
     for mtime, name, task_path in task_entries[:limit]:
         script_data = _safe_load_task_script(task_path)
+        status_data = _safe_load_task_status(task_path)
         params_data = script_data.get("params", {}) if script_data else {}
         video_file = _find_final_task_video(task_path)
         subject = (
-            params_data.get("video_subject")
+            status_data.get("video_subject")
+            or params_data.get("video_subject")
             or script_data.get("script", "")[:40]
             or name
         )
+        status_state = _normalize_task_state(status_data.get("state"))
+        try:
+            status_progress = int(status_data.get("progress", 0) or 0)
+        except (TypeError, ValueError):
+            status_progress = 0
+        try:
+            status_mtime = float(status_data.get("updated_at", 0) or 0)
+        except (TypeError, ValueError):
+            status_mtime = 0
         tasks.append(
             {
                 "task_id": name,
                 "subject": subject,
-                "state": const.TASK_STATE_COMPLETE if video_file else None,
-                "progress": 100 if video_file else 0,
-                "mtime": mtime,
+                "state": const.TASK_STATE_COMPLETE if video_file else status_state,
+                "progress": 100 if video_file else status_progress,
+                "failed_stage": status_data.get("failed_stage"),
+                "error": status_data.get("error"),
+                "mtime": status_mtime or mtime,
                 "task_path": task_path,
                 "video_file": video_file,
                 "source": "history",
@@ -1000,6 +1168,8 @@ def _collect_task_summaries(limit=20):
             "state": task.get("state"),
             "cross_post_state": task.get("cross_post_state"),
             "progress": int(task.get("progress", 0) or 0),
+            "failed_stage": task.get("failed_stage"),
+            "error": task.get("error"),
             "mtime": os.path.getmtime(task_path)
             if os.path.isdir(task_path)
             else history_task.get("mtime", 0),
@@ -1046,20 +1216,248 @@ def _is_headless_server():
     return not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
-def _open_task_path(task_path):
-    tasks_root = os.path.abspath(utils.task_dir())
-    normalized_path = os.path.abspath(task_path)
-    if not normalized_path.startswith(tasks_root + os.sep):
+def _resolve_task_directory(task_path):
+    """Resolve a task directory without allowing aliases outside storage/tasks."""
+
+    tasks_root = os.path.realpath(utils.task_dir())
+    normalized_path = os.path.realpath(task_path)
+    try:
+        is_task_directory = os.path.commonpath([tasks_root, normalized_path]) == tasks_root
+    except ValueError:
+        is_task_directory = False
+
+    if not is_task_directory or normalized_path == tasks_root:
         logger.warning(f"invalid task folder path: {normalized_path}")
+        return ""
+    return normalized_path if os.path.isdir(normalized_path) else ""
+
+
+def _show_task_files(task_path, *, rerun=False):
+    """Select a task directory for browser-side viewing and downloading."""
+
+    normalized_path = _resolve_task_directory(task_path)
+    if not normalized_path:
         return
-    if not os.path.isdir(normalized_path):
+    if st.session_state.get("task_files_dialog_path") != normalized_path:
+        _clear_task_file_archive()
+    st.session_state["task_files_dialog_path"] = normalized_path
+    if rerun:
+        st.rerun(scope="app")
+
+
+def _open_task_path(task_path):
+    # 浏览器事件在服务端进程执行；即使服务运行在 macOS，远程设备也无法看到
+    # 服务端 Finder。统一改为应用内文件视图，避免把“打开目录”误导为客户端操作。
+    _show_task_files(task_path, rerun=True)
+
+
+def _list_task_files(task_path, limit=TASK_FILE_VIEW_LIMIT):
+    """Return download-safe files relative to one task directory."""
+
+    normalized_path = _resolve_task_directory(task_path)
+    if not normalized_path:
+        return [], False
+
+    files = []
+    try:
+        for entry in sorted(
+            Path(normalized_path).rglob("*"),
+            key=lambda candidate: candidate.as_posix(),
+        ):
+            if not entry.is_file():
+                continue
+            resolved_file = entry.resolve()
+            try:
+                is_inside_task = (
+                    os.path.commonpath([normalized_path, str(resolved_file)])
+                    == normalized_path
+                )
+            except ValueError:
+                is_inside_task = False
+            if not is_inside_task:
+                logger.warning(f"skip task file outside task directory: {entry}")
+                continue
+            files.append(
+                {
+                    "path": str(resolved_file),
+                    "name": entry.relative_to(normalized_path).as_posix(),
+                    "size": resolved_file.stat().st_size,
+                }
+            )
+            if limit is not None and len(files) >= limit:
+                return files, True
+    except OSError as e:
+        logger.warning(f"failed to list task files: {normalized_path}, {e}")
+
+    return files, False
+
+
+def _task_file_signature(files):
+    """Return a stable archive cache key for the current task file set."""
+
+    digest = hashlib.sha256()
+    for file in files:
+        stat = os.stat(file["path"])
+        digest.update(file["name"].encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(stat.st_size).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(stat.st_mtime_ns).encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _clear_task_file_archive():
+    """Remove the per-session ZIP when changing or closing the task view."""
+
+    archive_path = st.session_state.pop("task_files_archive_path", "")
+    st.session_state.pop("task_files_archive_signature", None)
+    if not archive_path:
         return
-    if _is_headless_server():
-        # storage 目录通常以卷挂载映射回宿主机，提示相对路径即可定位文件。
-        rel_path = os.path.relpath(normalized_path, os.path.dirname(tasks_root))
-        st.toast(f"{tr('Open Task Folder')}: ./storage/{rel_path}", icon="📂")
-        return
-    webbrowser.open(f"file://{normalized_path}")
+    try:
+        os.remove(archive_path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning(f"failed to remove task archive: {archive_path}, {e}")
+
+
+def _build_task_file_archive(task_path, files):
+    """Create a ZIP from an already validated task file list."""
+
+    normalized_path = _resolve_task_directory(task_path)
+    if not normalized_path:
+        raise ValueError("task directory is unavailable")
+
+    descriptor, archive_path = tempfile.mkstemp(
+        prefix=f"mpt-task-{Path(normalized_path).name}-",
+        suffix=".zip",
+    )
+    os.close(descriptor)
+    try:
+        with zipfile.ZipFile(
+            archive_path,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=6,
+        ) as archive:
+            for file in files:
+                archive.write(file["path"], arcname=file["name"])
+        return archive_path
+    except Exception:
+        try:
+            os.remove(archive_path)
+        except OSError:
+            pass
+        raise
+
+
+def _dismiss_task_files_dialog():
+    _clear_task_file_archive()
+    st.session_state.pop("task_files_dialog_path", None)
+
+
+@st.dialog(
+    tr("Task Files"),
+    width="large",
+    on_dismiss=_dismiss_task_files_dialog,
+)
+def _render_task_files_dialog(task_path):
+    """Show task outputs in the browser instead of opening the server desktop."""
+
+    all_files, _ = _list_task_files(task_path, limit=None)
+    files = all_files[:TASK_FILE_VIEW_LIMIT]
+    is_truncated = len(all_files) > len(files)
+    archive_signature = _task_file_signature(all_files)
+    archive_path = st.session_state.get("task_files_archive_path", "")
+    archive_is_current = (
+        bool(archive_path)
+        and st.session_state.get("task_files_archive_signature")
+        == archive_signature
+        and os.path.isfile(archive_path)
+    )
+    if archive_path and not archive_is_current:
+        _clear_task_file_archive()
+
+    archive_col, download_col = st.columns(2)
+    if archive_col.button(
+        tr("Package All Files"),
+        key="package_task_files",
+        icon=":material/folder_zip:",
+        disabled=not all_files,
+        use_container_width=True,
+    ):
+        try:
+            with st.spinner(tr("Packaging Task Files")):
+                archive_path = _build_task_file_archive(task_path, all_files)
+        except (OSError, ValueError, zipfile.BadZipFile) as e:
+            logger.warning(f"failed to package task files: {task_path}, {e}")
+            st.error(tr("Task File Packaging Failed"))
+        else:
+            _clear_task_file_archive()
+            st.session_state["task_files_archive_path"] = archive_path
+            st.session_state["task_files_archive_signature"] = archive_signature
+            st.rerun()
+
+    if archive_is_current:
+        try:
+            with open(archive_path, "rb") as archive:
+                download_col.download_button(
+                    tr("Download ZIP"),
+                    data=archive,
+                    file_name=f"{Path(task_path).name}.zip",
+                    mime="application/zip",
+                    key="download_task_archive",
+                    icon=":material/download:",
+                    on_click="ignore",
+                    use_container_width=True,
+                )
+        except OSError as e:
+            logger.warning(f"failed to read task archive: {archive_path}, {e}")
+            _clear_task_file_archive()
+
+    if not files:
+        st.info(tr("No Task Files"))
+    else:
+        for file in files:
+            name_col, size_col, download_col = st.columns(
+                [5, 1, 1.4], vertical_alignment="center"
+            )
+            name_col.code(file["name"], language="text")
+            size_col.caption(_format_file_size(file["size"]))
+            try:
+                with open(file["path"], "rb") as artifact:
+                    download_col.download_button(
+                        tr("Download"),
+                        data=artifact,
+                        file_name=os.path.basename(file["path"]),
+                        mime=mimetypes.guess_type(file["path"])[0]
+                        or "application/octet-stream",
+                        key=(
+                            "download_task_file_"
+                            f"{hashlib.sha256(file['path'].encode('utf-8')).hexdigest()[:16]}"
+                        ),
+                        icon=":material/download:",
+                        on_click="ignore",
+                        use_container_width=True,
+                    )
+            except OSError as e:
+                logger.warning(
+                    f"failed to read task file for download: {file['path']}, {e}"
+                )
+                download_col.caption(tr("File Unavailable"))
+
+    if is_truncated:
+        st.warning(tr("Task Files Truncated"))
+
+    if st.button(
+        tr("Close"),
+        key="close_task_files_dialog",
+        icon=":material/close:",
+        use_container_width=True,
+    ):
+        _dismiss_task_files_dialog()
+        st.rerun()
 
 
 def _open_task_video(video_file):
@@ -1202,8 +1600,17 @@ def _render_task_table(filtered_tasks, key_prefix):
                     vertical_alignment="center",
                 )
                 row_cols[0].write(_task_state_label(task["state"], has_video))
+                if _task_state_filter_key(task) == "failed":
+                    failure_summary = task.get("failed_stage") or tr(
+                        "Task Failure Stage Unknown"
+                    )
+                    row_cols[0].caption(
+                        tr("Task Failure Stage").format(stage=failure_summary)
+                    )
                 row_cols[1].write(_format_task_time(task["mtime"]))
                 row_cols[2].write(_format_task_subject(task["subject"]))
+                if _task_state_filter_key(task) == "failed" and task.get("error"):
+                    row_cols[2].caption(str(task["error"])[:140])
                 row_cols[3].write(f"{task['progress']}%")
 
                 action_cols = row_cols[4].columns(
@@ -1235,16 +1642,19 @@ def _render_task_table(filtered_tasks, key_prefix):
                         _open_task_path(task["task_path"])
 
                 with action_cols[2]:
-                    restore_label = tr("Regenerate Task")
+                    is_failed = _task_state_filter_key(task) == "failed"
+                    restore_label = (
+                        tr("Continue Generation") if is_failed else tr("Regenerate Task")
+                    )
                     if st.button(
                         restore_label,
                         key=f"restore_task_{key_prefix}_{task_id}",
                         use_container_width=True,
-                        icon=":material/replay:",
+                        icon=(":material/play_arrow:" if is_failed else ":material/replay:"),
                         help=restore_label,
                         disabled=is_processing or not has_restore_data,
                     ):
-                        _queue_task_restore(task_id)
+                        _queue_task_restore(task_id, continue_generation=is_failed)
 
                 with action_cols[3]:
                     delete_label = tr("Delete Task")
@@ -1562,6 +1972,7 @@ def _apply_restored_params(params):
 
 def _dismiss_task_restore_dialog():
     st.session_state.pop("task_restore_candidate_id", None)
+    st.session_state.pop("task_restore_continue_generation", None)
 
 
 @st.dialog(
@@ -1570,15 +1981,22 @@ def _dismiss_task_restore_dialog():
     on_dismiss=_dismiss_task_restore_dialog,
 )
 def _render_task_restore_dialog(task_id):
+    continue_generation = bool(
+        st.session_state.get("task_restore_continue_generation", False)
+    )
     payload = _load_task_restore_payload(task_id)
     if payload is None:
         st.error(tr("Task Restore Failed"))
         if st.button(tr("Cancel"), key="cancel_invalid_task_restore"):
-            st.session_state.pop("task_restore_candidate_id", None)
+            _dismiss_task_restore_dialog()
             st.rerun(scope="app")
         return
 
-    st.write(tr("Regenerate Task Confirmation"))
+    st.write(
+        tr("Continue Generation Confirmation")
+        if continue_generation
+        else tr("Regenerate Task Confirmation")
+    )
     st.caption(_format_task_subject(payload["subject"], max_length=80))
     cancel_col, load_col = st.columns(2)
     if cancel_col.button(
@@ -1586,16 +2004,20 @@ def _render_task_restore_dialog(task_id):
         key="cancel_task_restore",
         use_container_width=True,
     ):
-        st.session_state.pop("task_restore_candidate_id", None)
+        _dismiss_task_restore_dialog()
         st.rerun(scope="app")
     if load_col.button(
-        tr("Load Task Configuration"),
+        tr("Continue Generation")
+        if continue_generation
+        else tr("Load Task Configuration"),
         key="confirm_task_restore",
         type="primary",
         use_container_width=True,
     ):
         st.session_state["task_restore_payload"] = payload
-        st.session_state.pop("task_restore_candidate_id", None)
+        if continue_generation:
+            st.session_state["continue_generation_after_restore"] = True
+        _dismiss_task_restore_dialog()
         st.rerun(scope="app")
 
 
@@ -1700,6 +2122,20 @@ def _render_top_bar():
                 on_click=_open_settings_dialog,
             )
 
+            if auth.get_webui_password():
+                if st.button(
+                    tr("Logout"),
+                    key="webui_logout_button",
+                    type="secondary",
+                    icon=":material/logout:",
+                    width="content",
+                ):
+                    st.session_state["webui_authenticated"] = False
+                    st.session_state["webui_remember_login"] = False
+                    st.session_state["webui_remember_cookie_action"] = "clear"
+                    st.session_state["webui_remember_cookie_token"] = ""
+                    st.rerun()
+
             language_codes = list(locales.keys())
             selected_index = 0
             for i, code in enumerate(language_codes):
@@ -1786,15 +2222,7 @@ def open_task_folder(task_id):
         normalized_task_id = str(UUID(str(task_id)))
         tasks_root = os.path.abspath(os.path.join(root_dir, "storage", "tasks"))
         path = os.path.abspath(os.path.join(tasks_root, normalized_task_id))
-
-        # 即使 UUID 校验通过，也再次确认最终路径仍在任务根目录内，避免
-        # 未来调用方调整 task_id 来源时引入路径穿越风险。
-        if not path.startswith(tasks_root + os.sep):
-            logger.warning(f"invalid task folder path: {path}")
-            return
-
-        if os.path.isdir(path):
-            webbrowser.open(f"file://{path}")
+        _show_task_files(path, rerun=True)
     except Exception as e:
         logger.exception(f"failed to open task folder: task_id={task_id}, error={e}")
 
@@ -1826,6 +2254,9 @@ def tr_optional(key, fallback_language=""):
 
 
 def render_onboarding_tour():
+    if _saved_ui_bool(ONBOARDING_TOUR_COMPLETED_KEY, False):
+        return
+
     # 引导只覆盖三个稳定入口，不尝试控制 Dialog、Tabs 或业务表单。这样既能让
     # 新用户理解完整流程，也不会把引导状态与 Streamlit 的动态组件生命周期耦合。
     steps = [
@@ -1877,11 +2308,13 @@ def render_onboarding_tour():
         one_time_tour=True,
     )
 
-    # 每个 Streamlit 会话只主动启动一次。是否已经完成则由组件通过浏览器
-    # localStorage 判断，避免页面 rerun 或普通控件交互反复弹出引导。
+    # 除会话内标记外，还持久化首次自动展示状态。streamlit-tour 的浏览器
+    # localStorage 标记在某些嵌入式或隐私模式会话中不会保留，之前会导致每次
+    # 重新打开页面都自动弹出引导。
     auto_start_key = f"{ONBOARDING_TOUR_KEY}-auto-started"
     if not st.session_state.get(auto_start_key, False):
         st.session_state[auto_start_key] = True
+        _set_runtime_config("ui", ONBOARDING_TOUR_COMPLETED_KEY, True)
         tour.start()
 
 
@@ -2472,6 +2905,21 @@ def reset_subtitle_settings():
 def render_script_prompt_preview(prompt):
     """展示将要发送给大模型的完整脚本生成提示词。"""
     st.code(prompt, language="markdown", wrap_lines=True)
+
+
+@st.dialog(tr("Script Paragraph Preview"), width="large")
+def render_script_paragraph_preview(paragraphs):
+    """Show the current script paragraph boundaries without changing them."""
+    st.caption(
+        tr("Script Paragraph Preview Summary").format(count=len(paragraphs))
+    )
+    for index, paragraph in enumerate(paragraphs, start=1):
+        st.markdown(
+            f"**{tr('Script Paragraph Item').format(index=index, sentences=script_service.count_sentences(paragraph))}**"
+        )
+        st.write(paragraph)
+        if index < len(paragraphs):
+            st.divider()
 
 
 def stable_segmented_control(
@@ -3833,6 +4281,24 @@ def _render_settings_dialog():
                         openai_image_prompt_template.strip(),
                     )
 
+                    openai_image_parallelism_value, openai_image_parallelism_max = (
+                        _get_openai_image_parallelism_settings()
+                    )
+                    openai_image_parallelism = st.number_input(
+                        tr("OpenAI Image Parallelism"),
+                        min_value=1,
+                        max_value=openai_image_parallelism_max,
+                        value=openai_image_parallelism_value,
+                        step=1,
+                        help=tr("OpenAI Image Parallelism Help"),
+                        key="openai_image_parallelism_input",
+                    )
+                    _set_runtime_config(
+                        "app",
+                        "openai_image_parallelism",
+                        int(openai_image_parallelism),
+                    )
+
     _save_runtime_config()
 
 
@@ -4418,10 +4884,13 @@ def _render_local_script_generation(params):
         elif "Error: " in terms:
             st.error(tr(terms))
         else:
-            st.session_state["video_script"] = script
+            editable_script = script_service.format_script_paragraphs(
+                script_service.split_script_paragraphs(script)
+            )
+            st.session_state["video_script"] = editable_script
             st.session_state["video_terms"] = ", ".join(terms)
             st.session_state["loomloom_video_scene_autofill_digest"] = (
-                hashlib.sha256(script.strip().encode("utf-8")).hexdigest()
+                hashlib.sha256(editable_script.encode("utf-8")).hexdigest()
             )
 
 
@@ -4457,11 +4926,14 @@ def _render_loomloom_candidates():
         type="primary",
         use_container_width=True,
     ):
-        st.session_state["video_script"] = selected.script
+        editable_script = script_service.format_script_paragraphs(
+            script_service.split_script_paragraphs(selected.script)
+        )
+        st.session_state["video_script"] = editable_script
         st.session_state["video_terms"] = ", ".join(selected.video_terms)
         # 与普通大模型生成文案保持一致：应用新候选后仅推荐一次素材数量。
         st.session_state["loomloom_video_scene_autofill_digest"] = (
-            hashlib.sha256(selected.script.strip().encode("utf-8")).hexdigest()
+            hashlib.sha256(editable_script.encode("utf-8")).hexdigest()
         )
         st.toast(tr("LoomLoom Candidate Applied"))
 
@@ -4880,12 +5352,53 @@ def _render_script_settings(panel, params):
                 _render_loomloom_script_generation(params)
             else:
                 _render_local_script_generation(params)
+
+            current_script = str(st.session_state.get("video_script") or "").strip()
+            if st.button(
+                tr("Smart Segment Script"),
+                key="smart_segment_script",
+                use_container_width=True,
+                type="secondary",
+                icon=":material/segment:",
+                disabled=not bool(current_script),
+            ):
+                with st.spinner(tr("Segmenting Script")):
+                    segmented_script = _run_llm_read_operation(
+                        "segment_script",
+                        lambda app_config_snapshot: llm.segment_script(
+                            current_script,
+                            language=params.video_language,
+                            app_config=app_config_snapshot,
+                        ),
+                    )
+                if segmented_script.startswith("Error: "):
+                    st.error(tr("Script Segmentation Failed"))
+                else:
+                    st.session_state["video_script"] = segmented_script
+                    st.toast(tr("Script Segmentation Complete"))
+                    st.rerun(scope="app")
+
             params.video_script = st.text_area(
                 tr("Video Script"),
                 help=tr("Video Script Help"),
                 height=180,
                 key="video_script",
             )
+            script_paragraphs = script_service.split_script_paragraphs(
+                params.video_script
+            )
+            if script_paragraphs:
+                st.caption(
+                    tr("Script Paragraph Summary").format(count=len(script_paragraphs))
+                )
+                if st.button(
+                    tr("View Script Paragraphs"),
+                    key="view_script_paragraphs",
+                    type="secondary",
+                    icon=":material/visibility:",
+                    use_container_width=True,
+                ):
+                    render_script_paragraph_preview(script_paragraphs)
             if _effective_script_generation_backend() == "loomloom":
                 st.caption(tr("LoomLoom Video Terms Reuse Help"))
             elif st.button(
@@ -5123,32 +5636,38 @@ def _render_video_settings(panel, params):
                 "ui", "video_fit_mode", params.video_fit_mode.value
             )
 
-            # MiniMax H3 的远端时长范围是 4～15 秒。选择秘塔时使用完整能力
-            # 范围，既避免 2/3 秒被按 4 秒计费，也让 WebUI 与 CLI、服务层一致。
-            video_clip_durations = (
-                list(
-                    range(
-                        metaso_minimax.DEFAULT_MIN_DURATION_SECONDS,
-                        metaso_minimax.DEFAULT_MAX_DURATION_SECONDS + 1,
+            if params.video_source == "openai_image":
+                # Paragraph image clips use the narration timeline calculated
+                # after TTS/subtitle generation. A fixed maximum duration would
+                # be misleading and is ignored by the timed composition path.
+                st.caption(tr("Paragraph Image Duration Automatic"))
+            else:
+                # MiniMax H3 的远端时长范围是 4～15 秒。选择秘塔时使用完整能力
+                # 范围，既避免 2/3 秒被按 4 秒计费，也让 WebUI 与 CLI、服务层一致。
+                video_clip_durations = (
+                    list(
+                        range(
+                            metaso_minimax.DEFAULT_MIN_DURATION_SECONDS,
+                            metaso_minimax.DEFAULT_MAX_DURATION_SECONDS + 1,
+                        )
                     )
+                    if params.video_source == "metaso_minimax"
+                    else [2, 3, 4, 5, 6, 7, 8, 9, 10]
                 )
-                if params.video_source == "metaso_minimax"
-                else [2, 3, 4, 5, 6, 7, 8, 9, 10]
-            )
-            params.video_clip_duration = stable_selectbox(
-                tr("Clip Duration"),
-                options=video_clip_durations,
-                default_value=_saved_ui_choice(
-                    "video_clip_duration",
-                    video_clip_durations,
-                    5 if params.video_source == "metaso_minimax" else 3,
-                ),
-                key="video_clip_duration_select",
-                help=tr("Clip Duration Help"),
-            )
-            _set_runtime_config(
-                "ui", "video_clip_duration", params.video_clip_duration
-            )
+                params.video_clip_duration = stable_selectbox(
+                    tr("Clip Duration"),
+                    options=video_clip_durations,
+                    default_value=_saved_ui_choice(
+                        "video_clip_duration",
+                        video_clip_durations,
+                        5 if params.video_source == "metaso_minimax" else 3,
+                    ),
+                    key="video_clip_duration_select",
+                    help=tr("Clip Duration Help"),
+                )
+                _set_runtime_config(
+                    "ui", "video_clip_duration", params.video_clip_duration
+                )
             clip_speed_key = localized_widget_key("video_clip_speed_slider")
             # session_state 可能来自旧任务、API 参数或旧版页面状态。控件创建前
             # 统一归一化，既保留合法选择，也确保 slider 始终收到 0.5～2.0
@@ -7221,10 +7740,17 @@ def _render_generation_controls(
         key="generate_video_button",
         on_click=_prepare_generation_task,
     )
+    continue_generation = bool(
+        st.session_state.pop("continue_generation_after_restore", False)
+    )
     render_onboarding_tour()
-    if start_button:
+    if start_button or continue_generation:
         _save_runtime_config()
-        task_id = st.session_state.get("pending_generation_task_id") or str(uuid4())
+        task_id = (
+            st.session_state.get("pending_generation_task_id")
+            if start_button
+            else str(uuid4())
+        ) or str(uuid4())
         _add_active_generation_task(
             task_id,
             subject=params.video_subject or params.video_script or task_id,
@@ -7331,11 +7857,21 @@ def _render_generation_controls(
             st.error(tr("Confirm Metaso MiniMax Charge Required"))
             st.stop()
 
-        if params.video_source == "openai_image" and not material.is_openai_image_enabled(
-            config.snapshot_config_with_pending(config.app)
-        ):
+        openai_image_config_error = None
+        if params.video_source == "openai_image":
+            validate_image_config = getattr(
+                material, "get_openai_image_configuration_error", None
+            )
+            app_config_snapshot = config.snapshot_config_with_pending(config.app)
+            if callable(validate_image_config):
+                openai_image_config_error = validate_image_config(
+                    app_config_snapshot
+                )
+            elif not material.is_openai_image_enabled(app_config_snapshot):
+                openai_image_config_error = tr("Please Configure the OpenAI Image Source")
+        if openai_image_config_error:
             _remove_active_generation_task(task_id)
-            st.error(tr("Please Configure the OpenAI Image Source"))
+            st.error(openai_image_config_error)
             st.stop()
 
         loomloom_video_request = None
@@ -7549,11 +8085,15 @@ def _render_generation_controls(
         logger.info(f"WebUI generation task submitted: task_id={task_id}")
 
     _render_current_generation_task()
-    return start_button
+    return start_button or continue_generation
 
 
 def _render_application():
     """按固定顺序渲染顶部栏、弹窗、生成表单和任务结果。"""
+    task_files_path = st.session_state.get("task_files_dialog_path")
+    if task_files_path:
+        _render_task_files_dialog(task_files_path)
+
     _render_top_bar()
 
     if st.session_state.get("settings_dialog_open", False):
@@ -7604,4 +8144,6 @@ def _render_application():
         _save_runtime_config()
 
 
+_sync_remembered_webui_login()
+_require_webui_login()
 _render_application()

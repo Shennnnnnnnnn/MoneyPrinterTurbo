@@ -81,6 +81,25 @@ class TestTaskArtifacts(unittest.TestCase):
         self.assertFalse(updated)
         self.assertFalse((self.task_dir / "script.json").exists())
 
+    def test_write_task_status_is_atomic_and_keeps_failure_details(self):
+        saved = task_artifacts.write_task_status(
+            "task-status",
+            {
+                "task_id": "task-status",
+                "state": -1,
+                "progress": 40,
+                "failed_stage": "materials",
+                "error": "gateway temporarily unavailable",
+            },
+        )
+
+        payload = json.loads((self.task_dir / "task-status.json").read_text())
+        self.assertTrue(saved)
+        self.assertEqual(payload["state"], -1)
+        self.assertEqual(payload["failed_stage"], "materials")
+        self.assertEqual(payload["error"], "gateway temporarily unavailable")
+        self.assertEqual(list(self.task_dir.glob(".task-status.json.*.tmp")), [])
+
     def test_patch_invalid_script_returns_false_without_overwrite(self):
         """历史 JSON 损坏时必须保留原文件、记录错误，并允许视频主流程继续。"""
         target = self.task_dir / "script.json"

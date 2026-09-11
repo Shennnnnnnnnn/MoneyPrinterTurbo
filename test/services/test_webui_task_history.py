@@ -1,8 +1,13 @@
 import ast
+import hashlib
+import json
 import os
 import re
+import tempfile
+import zipfile
 from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT_DIR = Path(__file__).parent.parent.parent
@@ -12,6 +17,11 @@ TASK_HISTORY_HELPERS = {
     "_build_video_download_name",
     "_build_restore_upload_requirements",
     "_get_unmet_restore_upload_requirements",
+    "_safe_load_task_status",
+    "_resolve_task_directory",
+    "_list_task_files",
+    "_task_file_signature",
+    "_build_task_file_archive",
 }
 TASK_HISTORY_CONSTANTS = {
     "_FINAL_VIDEO_PATTERN",
@@ -20,6 +30,8 @@ TASK_HISTORY_CONSTANTS = {
     "VOICE_MODE_TTS",
     "VOICE_MODE_UPLOAD",
     "VOICE_MODE_NONE",
+    "TASK_STATUS_FILENAME",
+    "TASK_FILE_VIEW_LIMIT",
 }
 
 
@@ -41,7 +53,17 @@ def _load_task_history_helpers():
         elif isinstance(node, ast.FunctionDef) and node.name in TASK_HISTORY_HELPERS:
             selected_nodes.append(node)
 
-    namespace = {"os": os, "re": re, "Mapping": Mapping}
+    namespace = {
+        "json": __import__("json"),
+        "hashlib": hashlib,
+        "logger": __import__("logging").getLogger(__name__),
+        "os": os,
+        "re": re,
+        "Mapping": Mapping,
+        "Path": Path,
+        "tempfile": tempfile,
+        "zipfile": zipfile,
+    }
     module = ast.fix_missing_locations(ast.Module(body=selected_nodes, type_ignores=[]))
     exec(compile(module, str(WEBUI_MAIN), "exec"), namespace)
     return namespace
@@ -57,6 +79,9 @@ build_restore_upload_requirements = TASK_HISTORY_NAMESPACE[
 get_unmet_restore_upload_requirements = TASK_HISTORY_NAMESPACE[
     "_get_unmet_restore_upload_requirements"
 ]
+safe_load_task_status = TASK_HISTORY_NAMESPACE["_safe_load_task_status"]
+list_task_files = TASK_HISTORY_NAMESPACE["_list_task_files"]
+build_task_file_archive = TASK_HISTORY_NAMESPACE["_build_task_file_archive"]
 
 
 def test_find_final_task_video_ignores_intermediate_files(tmp_path):
@@ -221,3 +246,71 @@ def test_restore_requirements_allow_replacing_upload_with_other_voice_modes():
             has_custom_audio=False,
             voice_mode=voice_mode,
         )
+
+
+def test_history_status_record_survives_runtime_state_loss(tmp_path):
+    payload = {
+        "task_id": "failed-task",
+        "state": -1,
+        "progress": 40,
+        "failed_stage": "materials",
+        "error": "gateway temporarily unavailable",
+    }
+    (tmp_path / "task-status.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    assert safe_load_task_status(str(tmp_path)) == payload
+
+
+def test_task_file_listing_keeps_downloads_inside_the_task_directory(tmp_path):
+    tasks_root = tmp_path / "tasks"
+    task_dir = tasks_root / "completed-task"
+    task_dir.mkdir(parents=True)
+    artifact = task_dir / "final-1.mp4"
+    artifact.write_bytes(b"video")
+    external_file = tmp_path / "outside.txt"
+    external_file.write_text("private", encoding="utf-8")
+
+    TASK_HISTORY_NAMESPACE["utils"] = SimpleNamespace(
+        task_dir=lambda: str(tasks_root)
+    )
+    files, is_truncated = list_task_files(str(task_dir))
+
+    assert files == [
+        {
+            "path": str(artifact.resolve()),
+            "name": "final-1.mp4",
+            "size": len(b"video"),
+        }
+    ]
+    assert is_truncated is False
+
+    try:
+        (task_dir / "outside-link.txt").symlink_to(external_file)
+    except (NotImplementedError, OSError):
+        return
+
+    files, _ = list_task_files(str(task_dir))
+    assert [file["name"] for file in files] == ["final-1.mp4"]
+
+
+def test_task_file_archive_preserves_relative_paths(tmp_path):
+    tasks_root = tmp_path / "tasks"
+    task_dir = tasks_root / "completed-task"
+    nested_dir = task_dir / "subtitles"
+    nested_dir.mkdir(parents=True)
+    (task_dir / "final-1.mp4").write_bytes(b"video")
+    (nested_dir / "subtitle.srt").write_text("subtitle", encoding="utf-8")
+
+    TASK_HISTORY_NAMESPACE["utils"] = SimpleNamespace(
+        task_dir=lambda: str(tasks_root)
+    )
+    files, is_truncated = list_task_files(str(task_dir), limit=None)
+    archive_path = build_task_file_archive(str(task_dir), files)
+    try:
+        assert is_truncated is False
+        with zipfile.ZipFile(archive_path) as archive:
+            assert archive.namelist() == ["final-1.mp4", "subtitles/subtitle.srt"]
+            assert archive.read("final-1.mp4") == b"video"
+            assert archive.read("subtitles/subtitle.srt") == b"subtitle"
+    finally:
+        os.remove(archive_path)

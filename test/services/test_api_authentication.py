@@ -71,7 +71,10 @@ class TestAPIAuthenticationHTTP(unittest.TestCase):
     def test_openapi_documents_api_key_header_for_v1_routes(self):
         """Swagger 必须显示 x-api-key，避免启用保护后只能靠猜测请求格式。"""
 
-        schema = self.client.get("/openapi.json").json()
+        config.app["api_key"] = "schema-secret"
+        schema = self.client.get(
+            "/openapi.json", headers={"x-api-key": "schema-secret"}
+        ).json()
         parameters = schema["paths"]["/api/v1/tasks"]["get"]["parameters"]
 
         self.assertTrue(
@@ -103,6 +106,22 @@ class TestAPIAuthenticationHTTP(unittest.TestCase):
 
         self.assertEqual(correct_first.status_code, 401)
         self.assertEqual(wrong_first.status_code, 401)
+
+    def test_configured_key_protects_every_non_preflight_route(self):
+        """健康检查、文档和挂载静态文件不得成为认证绕过路径。"""
+
+        config.app["api_key"] = "global-secret"
+
+        for path in ("/ping", "/docs", "/openapi.json", "/"):
+            with self.subTest(path=path):
+                missing = self.client.get(path)
+                accepted = self.client.get(
+                    path,
+                    headers={"x-api-key": "global-secret"},
+                )
+
+                self.assertEqual(missing.status_code, 401)
+                self.assertNotEqual(accepted.status_code, 401)
 
 
 if __name__ == "__main__":

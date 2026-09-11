@@ -15,8 +15,9 @@ listen_port = 8080
 
 # Optional protection for API routes and generated files under /tasks.
 # Leave empty for local backward-compatible access. When configured, clients
-# must send the same value in the x-api-key request header. Keep real keys only
-# in config.toml and never commit them.
+# must send the same value in the x-api-key request header. For a shared WebUI
+# login and API password, set MPT_ADMIN_PASSWORD in the service environment;
+# this environment value takes priority over api_key. Never commit credentials.
 # API 路由和 /tasks 生成文件的可选保护。留空时保持本地免认证行为；
 # 配置后客户端必须通过 x-api-key 请求头传入同一个值。
 # Task artifact requests also require this header; a browser address bar cannot
@@ -72,9 +73,9 @@ tls_verify = true
 # "ofox" generates brand-new clips through the OFox multi-model video API
 # (Seedance / Wan and other text-to-video models behind one key); generation
 # is billed per submitted clip.
-# "openai_image" generates one image per script keyword through any
+# "openai_image" generates one image per script paragraph through any
 # OpenAI-compatible /images/generations endpoint (local ComfyUI/SD gateways
-# or cloud relays) and renders it into a video clip.
+# or cloud relays), then keeps each image aligned with that paragraph's narration.
 video_source = "pexels"
 
 # API key lists support key rotation. Use straight ASCII double quotes and
@@ -171,8 +172,8 @@ metaso_minimax_run_timeout = 1800
 # OpenAI-compatible text-to-image material source ("openai_image"). Point the
 # base URL at any endpoint that speaks the OpenAI /images/generations protocol:
 # a local ComfyUI/SD gateway, a self-hosted relay, or a cloud aggregator.
-# Images are generated on demand (one per script keyword, billed per image by
-# your provider) and rendered into short zoom-effect video clips.
+# Images are generated on demand (one per blank-line-delimited script paragraph,
+# billed per image by your provider) and rendered into narration-aligned zoom clips.
 # Example: "https://api.openai.com/v1" or "http://127.0.0.1:8080/v1"
 openai_image_base_url = ""
 # Optional for local gateways that need no auth. Leave empty to send requests
@@ -187,10 +188,16 @@ openai_image_model = ""
 # landscape 1536x1024, square 1024x1024). Set a custom value (e.g. "1080x1920")
 # for local gateways that accept arbitrary resolutions.
 openai_image_size = ""
-# Optional prompt template applied to every search term. Use the "{term}"
-# placeholder to inject the keyword; leave empty to send terms as-is.
+# Optional prompt template applied to every paragraph. Use the "{term}"
+# placeholder to inject the paragraph text; legacy direct calls may still pass a
+# keyword. Leave empty to send the source text as-is.
 # Example: "cinematic photo of {term}, photorealistic, high detail"
 openai_image_prompt_template = ""
+# Maximum number of script-paragraph image requests submitted at once. The
+# default of 3 improves cloud generation throughput. Set 1 for local gateways
+# or a single GPU when concurrent jobs only queue or exhaust available memory.
+# Valid range: 1-8.
+openai_image_parallelism = 3
 
 # Optional TwelveLabs integration for semantic material ranking and video QA.
 # Install the optional dependency with: uv sync --extra twelvelabs

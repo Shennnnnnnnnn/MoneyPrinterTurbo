@@ -22,7 +22,7 @@ from app.models.llm_provider import (
     normalize_provider_override,
 )
 from app.models.schema import VideoScriptRequest, VideoSocialMetadataRequest
-from app.services import llm
+from app.services import llm, script as script_service
 
 RUN_INTEGRATION_TESTS = os.environ.get("MPT_RUN_INTEGRATION_TESTS", "").lower() in {
     "1",
@@ -89,6 +89,8 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertIn("- language: zh-CN", prompt)
         self.assertIn("# Additional User Requirements:", prompt)
         self.assertIn("语气轻松，面向程序员", prompt)
+        self.assertIn("3 to 5 spoken phrases", prompt)
+        self.assertIn("semantically coherent", prompt)
 
     def test_custom_system_prompt_keeps_runtime_context(self):
         """
@@ -107,6 +109,7 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertIn("- video subject: 露营", prompt)
         self.assertIn("- number of paragraphs: 2", prompt)
         self.assertIn("- language: en", prompt)
+        self.assertIn("3 to 5 spoken phrases", prompt)
 
     def test_generate_script_sends_custom_prompt_to_llm(self):
         captured = {}
@@ -154,6 +157,111 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertEqual(result, "Snapshot response")
         self.assertIs(captured["app_config"], app_config)
         self.assertEqual(captured["app_config"]["openai_api_key"], "snapshot-key")
+
+    def test_segment_script_only_accepts_paragraph_break_changes(self):
+        original = "One. Two. Three. Four. Five. Six."
+        segmented = "One. Two. Three.\n\nFour. Five. Six."
+
+        with patch.object(llm, "_generate_response", return_value=segmented):
+            result = llm.segment_script(original, language="en")
+
+        self.assertEqual(result, segmented)
+
+    def test_segment_script_discards_rewritten_content_and_uses_original(self):
+        original = "One, two, three, four, five, six."
+        with patch.object(
+            llm,
+            "_generate_response",
+            return_value="One, two, rewritten.",
+        ) as generate:
+            result = llm.segment_script(original)
+
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(
+            llm._script_content_signature(result),
+            llm._script_content_signature(original),
+        )
+        self.assertEqual(
+            [script_service.count_sentences(item) for item in result.split("\n\n")],
+            [3, 3],
+        )
+
+    def test_segment_script_regroups_existing_short_paragraphs(self):
+        original = "\n\n".join(
+            [
+                "第一口，第二口。",
+                "第三口，第四口。",
+                "第五口，第六口。",
+            ]
+        )
+
+        with (
+            patch.object(llm, "_max_retries", 1),
+            patch.object(llm, "_generate_response", return_value=original),
+        ):
+            result = llm.segment_script(original, language="zh-CN")
+
+        paragraphs = result.split("\n\n")
+        self.assertEqual(len(paragraphs), 2)
+        self.assertEqual(
+            [script_service.count_sentences(item) for item in paragraphs],
+            [3, 3],
+        )
+
+    def test_segment_script_does_not_accept_nineteen_unchanged_short_paragraphs(self):
+        original = "\n\n".join(
+            f"第{index}个气口，" for index in range(1, 20)
+        )
+
+        with (
+            patch.object(llm, "_max_retries", 1),
+            patch.object(llm, "_generate_response", return_value=original),
+        ):
+            result = llm.segment_script(original, language="zh-CN")
+
+        paragraphs = result.split("\n\n")
+        self.assertEqual(len(paragraphs), 4)
+        self.assertEqual(
+            [script_service.count_sentences(item) for item in paragraphs],
+            [5, 5, 5, 4],
+        )
+
+    def test_segment_script_reconstructs_text_from_compact_paragraph_sizes(self):
+        original = "一，二，三，四，五，六。"
+
+        with patch.object(
+            llm,
+            "_generate_response",
+            return_value='{"paragraph_sizes":[3,3]}',
+        ) as generate:
+            result = llm.segment_script(original, language="zh-CN")
+
+        self.assertEqual(
+            [script_service.count_sentences(item) for item in result.split("\n\n")],
+            [3, 3],
+        )
+        self.assertIn("paragraph_sizes", generate.call_args.args[0])
+
+    def test_segment_script_times_out_once_then_uses_local_fallback(self):
+        original = "一，二，三，四，五，六。"
+
+        with patch.object(
+            llm,
+            "_generate_response",
+            return_value="Error: request timed out",
+        ) as generate:
+            result = llm.segment_script(original, language="zh-CN")
+
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(
+            [script_service.count_sentences(item) for item in result.split("\n\n")],
+            [3, 3],
+        )
+        self.assertEqual(
+            generate.call_args.kwargs["request_timeout"],
+            llm.SCRIPT_SEGMENTATION_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(generate.call_args.kwargs["request_max_retries"], 0)
 
     def test_generate_script_strips_each_bracket_group_independently(self):
         """
@@ -337,6 +445,45 @@ class TestLiteLLMProvider(unittest.TestCase):
         self.assertEqual(
             normalize_provider_override("gpt-5.6-custom", "gpt-5.5"),
             "gpt-5.6-custom",
+        )
+
+    def test_openai_compatible_client_accepts_bounded_request_settings(self):
+        config.app["llm_provider"] = "openai"
+        config.app["openai_api_key"] = "test-key"
+        config.app["openai_base_url"] = "https://gateway.example.com/v1"
+        config.app["openai_model_name"] = "test-model"
+
+        fake_response = types.SimpleNamespace(
+            choices=[
+                types.SimpleNamespace(
+                    message=types.SimpleNamespace(content="ok")
+                )
+            ]
+        )
+        fake_client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(
+                completions=types.SimpleNamespace(
+                    create=lambda **kwargs: fake_response
+                )
+            )
+        )
+
+        with (
+            patch.object(llm, "OpenAI", return_value=fake_client) as openai_client,
+            patch.object(llm, "ChatCompletion", types.SimpleNamespace),
+        ):
+            result = llm._generate_response(
+                "test",
+                request_timeout=12.0,
+                request_max_retries=0,
+            )
+
+        self.assertEqual(result, "ok")
+        openai_client.assert_called_once_with(
+            api_key="test-key",
+            base_url="https://gateway.example.com/v1",
+            timeout=12.0,
+            max_retries=0,
         )
 
     def test_provider_registry_has_unique_stable_ids(self):

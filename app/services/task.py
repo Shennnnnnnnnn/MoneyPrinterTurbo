@@ -22,6 +22,7 @@ from app.services import (
     material,
     metaso_minimax,
     ofox,
+    script as script_service,
     sonilo,
     subtitle,
     task_artifacts,
@@ -284,7 +285,27 @@ def _mark_task_failed(
         error=failure["error"],
         **failure_details,
     )
+    record_task_status(
+        task_id,
+        state=failure["state"],
+        progress=failure["progress"],
+        failed_stage=failure["failed_stage"],
+        error=failure["error"],
+        **failure_details,
+    )
     return failure
+
+
+def record_task_status(task_id: str, state: int, progress: int = 0, **details) -> bool:
+    """Persist a minimal task lifecycle record for task-history recovery."""
+    payload = {
+        "task_id": task_id,
+        "state": state,
+        "progress": max(0, min(int(progress or 0), 100)),
+        "updated_at": time.time(),
+    }
+    payload.update({key: value for key, value in details.items() if value is not None})
+    return task_artifacts.write_task_status(task_id, payload)
 
 
 def generate_script(task_id, params):
@@ -350,9 +371,16 @@ def generate_terms(task_id, params, video_script):
     return video_terms
 
 
-def save_script_data(task_id, video_script, video_terms, params):
+def save_script_data(
+    task_id,
+    video_script,
+    video_terms,
+    params,
+    script_paragraphs=None,
+):
     script_data = {
         "script": video_script,
+        "script_paragraphs": list(script_paragraphs or []),
         "search_terms": video_terms,
         "params": params,
     }
@@ -639,6 +667,7 @@ def get_video_materials(
     params,
     video_terms,
     audio_duration,
+    script_segments=None,
     loomloom_video_request: loomloom.LoomLoomConfirmedVideoRequest | None = None,
 ):
     if params.video_source == "local":
@@ -733,6 +762,8 @@ def get_video_materials(
                 audio_duration=audio_duration * params.video_count,
                 max_clip_duration=params.video_clip_duration,
                 match_script_order=params.match_materials_to_script,
+                script_segments=script_segments,
+                clip_speed=params.video_clip_speed,
             )
         except volcengine_seedance.VolcEngineSeedanceError as exc:
             # 未确认状态和已生成但下载失败都对应一个可在方舟控制台恢复的远端
@@ -834,7 +865,13 @@ def _record_loomloom_run_reference(
 
 
 def generate_final_videos(
-    task_id, params, downloaded_videos, audio_file, subtitle_path, audio_duration
+    task_id,
+    params,
+    downloaded_videos,
+    audio_file,
+    subtitle_path,
+    audio_duration,
+    script_segments=None,
 ):
     final_video_paths = []
     combined_video_paths = []
@@ -846,7 +883,9 @@ def generate_final_videos(
     )
     # 多视频生成默认会打散素材以增加差异；但“按文案顺序匹配素材”追求的是
     # 时间线稳定性和可解释性，所以开启后所有输出都使用顺序拼接。
-    if params.match_materials_to_script:
+    if params.video_source == "openai_image" and script_segments:
+        video_concat_mode = VideoConcatMode.sequential
+    elif params.match_materials_to_script:
         video_concat_mode = VideoConcatMode.sequential
     elif params.video_count == 1:
         video_concat_mode = params.video_concat_mode
@@ -872,6 +911,11 @@ def generate_final_videos(
             max_clip_duration=params.video_clip_duration,
             threads=params.n_threads,
             clip_speed=params.video_clip_speed,
+            clip_durations=(
+                [float(segment["duration"]) for segment in script_segments]
+                if params.video_source == "openai_image" and script_segments
+                else None
+            ),
         )
 
         _progress += 50 / params.video_count / 2
@@ -1329,19 +1373,16 @@ def _run_pipeline(
             "Metaso MiniMax requires an API key",
         )
 
-    if (
-        stop_at in {"materials", "video"}
-        and params.video_source == "openai_image"
-        and not material.is_openai_image_enabled(
+    openai_image_config_error = None
+    if stop_at in {"materials", "video"} and params.video_source == "openai_image":
+        openai_image_config_error = material.get_openai_image_configuration_error(
             config.snapshot_config_with_pending(config.app)
         )
-    ):
+    if openai_image_config_error:
         return _mark_task_failed(
             task_id,
             "preflight",
-            "OpenAI image source requires openai_image_base_url and "
-            "openai_image_model in config.toml (openai_image_api_keys is "
-            "optional for local gateways that need no auth)",
+            openai_image_config_error,
         )
 
     # 只有完整成片流程需要视频配乐供应商。尽早阻止缺少 Key 的完整任务，避免
@@ -1405,17 +1446,29 @@ def _run_pipeline(
         )
         return _mark_task_failed(task_id, "script", error)
 
+    script_paragraphs = script_service.split_script_paragraphs(video_script)
+    segmented_script = script_service.format_script_paragraphs(script_paragraphs)
+    if segmented_script:
+        video_script = segmented_script
+    params.video_script = video_script
+
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=10)
 
     if stop_at == "script":
         sm.state.update_task(
             task_id, state=const.TASK_STATE_COMPLETE, progress=100, script=video_script
         )
+        record_task_status(task_id, state=const.TASK_STATE_COMPLETE, progress=100)
         return {"script": video_script}
 
     # 2. Generate terms
     video_terms = ""
-    if params.video_source != "local":
+    if params.video_source == "openai_image":
+        # Image generation uses the complete paragraph as visual context. Global
+        # keyword extraction would lose paragraph boundaries and make exact
+        # narration-to-image alignment impossible.
+        video_terms = list(script_paragraphs)
+    elif params.video_source != "local":
         video_terms = generate_terms(task_id, params, video_script)
         if not video_terms:
             return _mark_task_failed(
@@ -1424,12 +1477,19 @@ def _run_pipeline(
                 "failed to generate video search terms",
             )
 
-    save_script_data(task_id, video_script, video_terms, params)
+    save_script_data(
+        task_id,
+        video_script,
+        video_terms,
+        params,
+        script_paragraphs=script_paragraphs,
+    )
 
     if stop_at == "terms":
         sm.state.update_task(
             task_id, state=const.TASK_STATE_COMPLETE, progress=100, terms=video_terms
         )
+        record_task_status(task_id, state=const.TASK_STATE_COMPLETE, progress=100)
         return {"script": video_script, "terms": video_terms}
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=20)
@@ -1458,6 +1518,7 @@ def _run_pipeline(
             progress=100,
             audio_file=audio_file,
         )
+        record_task_status(task_id, state=const.TASK_STATE_COMPLETE, progress=100)
         return {"audio_file": audio_file, "audio_duration": audio_duration}
 
     # 4. Generate subtitle
@@ -1472,9 +1533,30 @@ def _run_pipeline(
             progress=100,
             subtitle_path=subtitle_path,
         )
+        record_task_status(task_id, state=const.TASK_STATE_COMPLETE, progress=100)
         return {"subtitle_path": subtitle_path}
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
+
+    script_segments = []
+    if params.video_source == "openai_image":
+        exact_audio_duration = voice.get_audio_duration(audio_file) or audio_duration
+        script_segments = [
+            segment.to_dict()
+            for segment in script_service.build_script_timeline(
+                script_paragraphs,
+                audio_duration=exact_audio_duration,
+                sub_maker=sub_maker,
+                subtitle_path=subtitle_path,
+            )
+        ]
+        if not script_segments:
+            return _mark_task_failed(
+                task_id,
+                "materials",
+                "failed to build paragraph timing for image generation",
+            )
+        task_artifacts.patch_script_data(task_id, script_segments=script_segments)
 
     # 5. Get video materials
     downloaded_videos = get_video_materials(
@@ -1482,6 +1564,7 @@ def _run_pipeline(
         params,
         video_terms,
         audio_duration,
+        script_segments=script_segments,
         loomloom_video_request=loomloom_video_request,
     )
     if not downloaded_videos:
@@ -1498,6 +1581,7 @@ def _run_pipeline(
             progress=100,
             materials=downloaded_videos,
         )
+        record_task_status(task_id, state=const.TASK_STATE_COMPLETE, progress=100)
         return {"materials": downloaded_videos}
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=50)
@@ -1516,6 +1600,7 @@ def _run_pipeline(
             audio_file,
             subtitle_path,
             audio_duration,
+            script_segments=script_segments,
         )
     )
 
@@ -1550,6 +1635,8 @@ def _run_pipeline(
         "videos": final_video_paths,
         "combined_videos": combined_video_paths,
         "script": video_script,
+        "script_paragraphs": script_paragraphs,
+        "script_segments": script_segments or None,
         "terms": video_terms,
         "audio_file": audio_file,
         "audio_duration": audio_duration,
@@ -1563,6 +1650,12 @@ def _run_pipeline(
     }
     sm.state.update_task(
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
+    )
+    record_task_status(
+        task_id,
+        state=const.TASK_STATE_COMPLETE,
+        progress=100,
+        video_subject=params.video_subject or video_script,
     )
 
     if should_cross_post:
@@ -1604,6 +1697,28 @@ def start(
     ``allow_server_file_input`` 只供本机 CLI 使用。HTTP API 和 WebUI 必须保持
     默认值，让自定义音频始终受当前任务目录约束。
     """
+    try:
+        task_artifacts.write_script_data(
+            task_id,
+            {
+                "script": params.video_script,
+                "search_terms": params.video_terms,
+                "params": params,
+            },
+        )
+    except Exception as exc:
+        # 历史恢复文件不能阻断任务本身；后续 save_script_data 仍会按原有语义
+        # 尝试写入完整的生成脚本和关键词。
+        logger.warning(
+            "failed to write initial task history data: "
+            f"task_id={task_id}, error={type(exc).__name__}, detail={exc}"
+        )
+    record_task_status(
+        task_id,
+        state=const.TASK_STATE_PROCESSING,
+        progress=0,
+        video_subject=params.video_subject or params.video_script or task_id,
+    )
     try:
         return _run_pipeline(
             task_id,

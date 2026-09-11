@@ -4,7 +4,7 @@ from unittest.mock import patch
 from streamlit.testing.v1 import AppTest
 
 from app.config import config
-from app.services import voice
+from app.services import llm, voice
 
 
 ROOT_DIR = Path(__file__).parent.parent.parent
@@ -495,3 +495,118 @@ def test_script_order_constraint_does_not_replace_saved_concat_preference():
         assert _widget_by_key(
             unconstrained_session.selectbox, "video_concat_mode_select"
         ).value == "random"
+
+
+def test_smart_script_segmentation_updates_the_editable_script():
+    test_app_config = dict(
+        config.app,
+        video_source="pexels",
+        match_materials_to_script=False,
+    )
+    test_ui_config = dict(
+        config.ui,
+        language="en",
+        voice_mode="tts",
+        tts_server="azure-tts-v1",
+        voice_name="en-US-JennyNeural-Female",
+    )
+    original = "One. Two. Three. Four. Five. Six."
+    segmented = "One. Two. Three.\n\nFour. Five. Six."
+
+    with (
+        patch.object(config, "app", test_app_config),
+        patch.object(config, "ui", test_ui_config),
+        patch.object(config, "try_save_config", return_value=True),
+        patch.object(
+            voice,
+            "get_all_azure_voices",
+            return_value=["en-US-JennyNeural-Female"],
+        ),
+        patch.object(llm, "segment_script", return_value=segmented) as segment,
+    ):
+        app = _new_app()
+        _widget_by_key(app.text_area, "video_script").set_value(original).run()
+        _widget_by_key(app.button, "smart_segment_script").click().run()
+
+    assert [str(item.value) for item in app.exception] == []
+    assert app.session_state["video_script"] == segmented
+    segment.assert_called_once()
+
+
+def test_script_paragraph_preview_dialog_lists_each_paragraph():
+    test_app_config = dict(
+        config.app,
+        video_source="openai_image",
+        match_materials_to_script=False,
+    )
+    test_ui_config = dict(
+        config.ui,
+        language="en",
+        voice_mode="tts",
+        tts_server="azure-tts-v1",
+        voice_name="en-US-JennyNeural-Female",
+    )
+
+    with (
+        patch.object(config, "app", test_app_config),
+        patch.object(config, "ui", test_ui_config),
+        patch.object(config, "try_save_config", return_value=True),
+        patch.object(
+            voice,
+            "get_all_azure_voices",
+            return_value=["en-US-JennyNeural-Female"],
+        ),
+    ):
+        app = _new_app()
+        next(
+            item for item in app.text_area if str(getattr(item, "key", "")) == "video_script"
+        ).set_value(
+            "One. Two. Three. Four. Five. Six."
+        ).run()
+        _widget_by_key(app.button, "view_script_paragraphs").click().run()
+
+    assert [str(item.value) for item in app.exception] == []
+    markdown_values = [str(item.value) for item in app.markdown]
+    assert "**Paragraph 1 · 3 spoken phrase(s)**" in markdown_values
+    assert "**Paragraph 2 · 3 spoken phrase(s)**" in markdown_values
+    assert "One. Two. Three." in markdown_values
+    assert "Four. Five. Six." in markdown_values
+
+
+def test_openai_image_uses_automatic_paragraph_duration_without_fixed_control():
+    test_app_config = dict(
+        config.app,
+        video_source="openai_image",
+        match_materials_to_script=False,
+    )
+    test_ui_config = dict(
+        config.ui,
+        language="en",
+        voice_mode="tts",
+        tts_server="azure-tts-v1",
+        voice_name="en-US-JennyNeural-Female",
+        video_clip_duration=9,
+    )
+
+    with (
+        patch.object(config, "app", test_app_config),
+        patch.object(config, "ui", test_ui_config),
+        patch.object(config, "try_save_config", return_value=True),
+        patch.object(
+            voice,
+            "get_all_azure_voices",
+            return_value=["en-US-JennyNeural-Female"],
+        ),
+    ):
+        app = _new_app()
+
+    assert [str(item.value) for item in app.exception] == []
+    assert all(
+        not str(getattr(item, "key", "")).startswith("video_clip_duration_select")
+        for item in app.selectbox
+    )
+    assert any(
+        "automatically timed to the actual narration" in str(item.value)
+        for item in app.caption
+    )
+    assert test_ui_config["video_clip_duration"] == 9

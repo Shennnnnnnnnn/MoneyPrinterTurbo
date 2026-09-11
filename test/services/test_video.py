@@ -794,6 +794,64 @@ class TestVideoService(unittest.TestCase):
                 )
                 self.assertEqual(result, combined_video_path)
 
+    def test_combine_videos_preserves_timed_paragraph_order_and_duration(self):
+        class _FakeAudioClip:
+            duration = 5.0
+
+            def close(self):
+                pass
+
+        class _FakeVideoClip:
+            def __init__(self, duration):
+                self.duration = duration
+                self.size = (1080, 1920)
+                self.w = 1080
+                self.h = 1920
+
+            def subclipped(self, start_time, end_time):
+                return _FakeVideoClip(end_time - start_time)
+
+            def with_speed_scaled(self, factor):
+                return _FakeVideoClip(self.duration / factor)
+
+        source_durations = {"first.mp4": 4.1, "second.mp4": 6.1}
+        written_durations = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(vd, "AudioFileClip", return_value=_FakeAudioClip()),
+                patch.object(
+                    vd,
+                    "_open_video_clip_quietly",
+                    side_effect=lambda path: _FakeVideoClip(source_durations[path]),
+                ),
+                patch.object(
+                    vd,
+                    "_write_videofile_with_codec_fallback",
+                    side_effect=lambda clip, *_args, **_kwargs: written_durations.append(
+                        clip.duration
+                    ),
+                ),
+                patch.object(vd, "_prioritize_unique_source_clips") as prioritize,
+                patch.object(vd, "concat_video_clips_with_ffmpeg") as concat,
+                patch.object(vd, "delete_files"),
+            ):
+                vd.combine_videos(
+                    combined_video_path=os.path.join(temp_dir, "combined.mp4"),
+                    video_paths=["first.mp4", "second.mp4"],
+                    audio_file="audio.mp3",
+                    video_concat_mode=vd.VideoConcatMode.random,
+                    clip_speed=2.0,
+                    clip_durations=[2.0, 3.0],
+                )
+
+        prioritize.assert_not_called()
+        self.assertEqual(written_durations, [2.0, 3.0])
+        clip_files = concat.call_args.kwargs["clip_files"]
+        self.assertTrue(clip_files[0].endswith("temp-clip-1.mp4"))
+        self.assertTrue(clip_files[1].endswith("temp-clip-2.mp4"))
+        self.assertEqual(concat.call_args.kwargs["max_duration"], 5.0)
+
     def _capture_source_ranges_for_clip_speed(
         self,
         *,

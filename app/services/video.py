@@ -50,6 +50,7 @@ class SubClippedVideoClip:
         height=None,
         duration=None,
         source_file_path=None,
+        target_duration=None,
     ):
         self.file_path = file_path
         self.start_time = start_time
@@ -57,6 +58,7 @@ class SubClippedVideoClip:
         self.width = width
         self.height = height
         self.source_file_path = source_file_path or file_path
+        self.target_duration = target_duration
         if duration is None:
             self.duration = end_time - start_time
         else:
@@ -689,6 +691,7 @@ def combine_videos(
     threads: int = 2,
     clip_speed: float = 1.0,
     video_fit_mode: VideoFitMode = VideoFitMode.cover,
+    clip_durations: List[float] | None = None,
 ) -> str:
     audio_clip = AudioFileClip(audio_file)
     try:
@@ -718,6 +721,18 @@ def combine_videos(
     # 仍固定读取 3 秒再慢放、裁剪，下一段却从源视频第 3 秒开始，会跳过中间
     # 1.5 秒画面。该计算同时保证不同速度下的源时间线连续且无重叠。
     source_clip_duration = max_clip_duration * normalized_clip_speed
+    timed_clip_durations = None
+    if clip_durations is not None:
+        if len(clip_durations) != len(video_paths):
+            raise ValueError(
+                "clip_durations must contain one duration for every video path"
+            )
+        timed_clip_durations = []
+        for duration in clip_durations:
+            value = float(duration)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError("clip_durations must contain positive finite values")
+            timed_clip_durations.append(value)
     output_dir = os.path.dirname(combined_video_path)
 
     aspect = VideoAspect(video_aspect)
@@ -727,11 +742,33 @@ def combine_videos(
     processed_clips = []
     subclipped_items = []
     video_duration = 0
-    for video_path in video_paths:
+    for video_index, video_path in enumerate(video_paths):
         clip = _open_video_clip_quietly(video_path)
         clip_duration = clip.duration
         clip_w, clip_h = clip.size
         close_clip(clip)
+
+        if timed_clip_durations is not None:
+            target_duration = timed_clip_durations[video_index]
+            required_source_duration = target_duration * normalized_clip_speed
+            if clip_duration + (1 / fps) < required_source_duration:
+                raise ValueError(
+                    "timed visual material is shorter than its narration segment: "
+                    f"index={video_index + 1}, source={clip_duration:.3f}s, "
+                    f"required={required_source_duration:.3f}s"
+                )
+            subclipped_items.append(
+                SubClippedVideoClip(
+                    file_path=video_path,
+                    start_time=0,
+                    end_time=min(required_source_duration, clip_duration),
+                    width=clip_w,
+                    height=clip_h,
+                    source_file_path=video_path,
+                    target_duration=target_duration,
+                )
+            )
+            continue
         
         start_time = 0
 
@@ -757,10 +794,11 @@ def combine_videos(
             if video_concat_mode.value == VideoConcatMode.sequential.value:
                 break
 
-    subclipped_items = _prioritize_unique_source_clips(
-        subclipped_items=subclipped_items,
-        concat_mode=video_concat_mode,
-    )
+    if timed_clip_durations is None:
+        subclipped_items = _prioritize_unique_source_clips(
+            subclipped_items=subclipped_items,
+            concat_mode=video_concat_mode,
+        )
         
     logger.debug(f"total subclipped items: {len(subclipped_items)}")
     
@@ -832,7 +870,16 @@ def combine_videos(
                 shuffle_transition = random.choice(transition_funcs)
                 clip = shuffle_transition(clip)
 
-            if clip.duration > max_clip_duration:
+            target_duration = subclipped_item.target_duration
+            if target_duration is not None and clip.duration > target_duration:
+                clip = clip.subclipped(0, target_duration)
+            elif target_duration is not None and clip.duration + (1 / fps) < target_duration:
+                raise ValueError(
+                    "timed visual material became shorter after processing: "
+                    f"index={i + 1}, output={clip.duration:.3f}s, "
+                    f"required={target_duration:.3f}s"
+                )
+            elif clip.duration > max_clip_duration:
                 clip = clip.subclipped(0, max_clip_duration)
                 
             # wirte clip to temp file
@@ -846,7 +893,7 @@ def combine_videos(
             )
 
             # Store clip duration before closing
-            clip_duration_saved = clip.duration
+            clip_duration_saved = target_duration or clip.duration
             close_clip(clip)
 
             processed_clips.append(
@@ -862,6 +909,8 @@ def combine_videos(
             
         except Exception as e:
             logger.error(f"failed to process clip: {str(e)}")
+            if timed_clip_durations is not None:
+                raise
     
     # loop processed clips until the video duration covers the audio duration and the small safety margin.
     if video_duration < required_video_duration:

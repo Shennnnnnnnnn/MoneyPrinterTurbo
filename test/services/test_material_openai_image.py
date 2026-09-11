@@ -4,6 +4,7 @@ import io
 import os
 import shutil
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -49,6 +50,7 @@ class TestOpenAIImageProvider(unittest.TestCase):
         # 本地 config.toml 里的设置影响默认行为场景的断言。
         config.app.pop("openai_image_prompt_template", None)
         config.app.pop("openai_image_size", None)
+        config.app.pop("openai_image_parallelism", None)
         config.app.pop("tls_verify", None)
         config.proxy.clear()
 
@@ -249,6 +251,29 @@ class TestOpenAIImageProvider(unittest.TestCase):
             material.OPENAI_IMAGE_RETRY_BACKOFF_SECONDS[0],
         )
 
+    def test_generate_images_openai_retries_cloudflare_gateway_error(self):
+        """Cloudflare 52x HTML error pages are transient gateway failures."""
+        image_data = _png_bytes()
+        responses = [
+            _image_response("<!doctype html><title>520</title>", status_code=520),
+            _image_response(
+                {"data": [{"b64_json": base64.b64encode(image_data).decode("ascii")}]}
+            ),
+        ]
+
+        with (
+            tempfile.TemporaryDirectory() as save_dir,
+            patch("app.services.material.requests.post", side_effect=responses) as post,
+            patch("app.services.material.time.sleep") as sleep,
+        ):
+            results = material.generate_images_openai(
+                "gateway retry", minimum_duration=5, save_dir=save_dir
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(sleep.call_count, 1)
+
     def test_generate_images_openai_rotates_key_on_401(self):
         """
         401 表示当前 key 被拒。配置了多个 key 时,重试必须借助 get_api_key
@@ -401,6 +426,23 @@ class TestOpenAIImageProvider(unittest.TestCase):
     # 配置开关
     # ------------------------------------------------------------------
 
+    def test_openai_image_parallelism_defaults_to_three_and_is_bounded(self):
+        self.assertEqual(material.get_openai_image_parallelism(), 3)
+        self.assertEqual(
+            material.get_openai_image_parallelism({"openai_image_parallelism": 0}),
+            1,
+        )
+        self.assertEqual(
+            material.get_openai_image_parallelism({"openai_image_parallelism": 99}),
+            material.OPENAI_IMAGE_MAX_PARALLELISM,
+        )
+        self.assertEqual(
+            material.get_openai_image_parallelism(
+                {"openai_image_parallelism": "invalid"}
+            ),
+            3,
+        )
+
     def test_is_openai_image_enabled_requires_full_configuration(self):
         """
         base_url 和 model 缺一不可;API key 允许为空——完全本地的
@@ -419,6 +461,40 @@ class TestOpenAIImageProvider(unittest.TestCase):
 
         config.app["openai_image_model"] = ""
         self.assertFalse(material.is_openai_image_enabled())
+
+    def test_generate_images_openai_retries_499_context_canceled(self):
+        image_data = _png_bytes()
+        responses = [
+            _image_response(
+                {
+                    "error": {
+                        "message": (
+                            "Post /images/generations: context canceled"
+                        )
+                    }
+                },
+                status_code=499,
+            ),
+            _image_response(
+                {
+                    "data": [
+                        {"b64_json": base64.b64encode(image_data).decode("ascii")}
+                    ]
+                }
+            ),
+        ]
+
+        with (
+            patch("app.services.material.requests.post", side_effect=responses) as post,
+            patch("app.services.material.time.sleep") as sleep,
+        ):
+            results = material.generate_images_openai(
+                "retry canceled request", minimum_duration=5, save_dir=self.save_dir
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(sleep.call_count, 1)
 
     def test_generate_images_openai_sends_no_authorization_without_key(self):
         """
@@ -804,6 +880,142 @@ class TestOpenAIImageProvider(unittest.TestCase):
 
         generate.assert_not_called()
         self.assertEqual(result, [])
+
+    def test_download_videos_openai_image_generates_one_timed_clip_per_paragraph(self):
+        segments = [
+            {"index": 1, "text": "First paragraph.", "start": 0.0, "end": 2.0, "duration": 2.0},
+            {"index": 2, "text": "Second paragraph.", "start": 2.0, "end": 5.0, "duration": 3.0},
+        ]
+
+        def fake_generate(search_term, minimum_duration, video_aspect, save_dir=""):
+            slug = "first" if search_term.startswith("First") else "second"
+            return [self._generated_item(search_term, f"/tmp/{slug}.png")]
+
+        with (
+            patch(
+                "app.services.material.generate_images_openai",
+                side_effect=fake_generate,
+            ) as generate,
+            patch(
+                "app.services.material._render_openai_image_video",
+                side_effect=lambda image_path, duration: f"{image_path}.mp4",
+            ) as render,
+            patch("app.services.material._persist_material_sources") as persist,
+        ):
+            result = material.download_videos(
+                task_id="paragraph-images",
+                search_terms=["ignored keyword"],
+                source="openai_image",
+                audio_duration=100,
+                script_segments=segments,
+                clip_speed=2.0,
+            )
+
+        self.assertCountEqual(
+            [call.kwargs["search_term"] for call in generate.call_args_list],
+            ["First paragraph.", "Second paragraph."],
+        )
+        self.assertCountEqual(
+            [call.kwargs["minimum_duration"] for call in generate.call_args_list],
+            [5, 7],
+        )
+        self.assertAlmostEqual(render.call_args_list[0].args[1], 4 + 1 / 30)
+        self.assertAlmostEqual(render.call_args_list[1].args[1], 6 + 1 / 30)
+        self.assertEqual(result, ["/tmp/first.png.mp4", "/tmp/second.png.mp4"])
+        saved_sources = persist.call_args.args[1]
+        self.assertEqual(
+            [item["script_segment_index"] for item in saved_sources],
+            [1, 2],
+        )
+
+    def test_download_videos_openai_image_generates_paragraphs_concurrently(self):
+        segments = [
+            {"text": "First paragraph.", "start": 0.0, "end": 2.0, "duration": 2.0},
+            {"text": "Second paragraph.", "start": 2.0, "end": 4.0, "duration": 2.0},
+            {"text": "Third paragraph.", "start": 4.0, "end": 6.0, "duration": 2.0},
+        ]
+        barrier = threading.Barrier(3)
+        active_lock = threading.Lock()
+        active_workers = 0
+        max_active_workers = 0
+
+        def fake_generate(search_term, minimum_duration, video_aspect, save_dir=""):
+            nonlocal active_workers, max_active_workers
+            with active_lock:
+                active_workers += 1
+                max_active_workers = max(max_active_workers, active_workers)
+            try:
+                barrier.wait(timeout=2)
+                slug = search_term.split()[0].lower()
+                return [self._generated_item(search_term, f"/tmp/{slug}.png")]
+            finally:
+                with active_lock:
+                    active_workers -= 1
+
+        with (
+            patch(
+                "app.services.material.generate_images_openai",
+                side_effect=fake_generate,
+            ),
+            patch(
+                "app.services.material._render_openai_image_video",
+                side_effect=lambda image_path, duration: f"{image_path}.mp4",
+            ),
+            patch("app.services.material._persist_material_sources"),
+        ):
+            result = material.download_videos(
+                task_id="parallel-paragraph-images",
+                search_terms=[],
+                source="openai_image",
+                audio_duration=6,
+                script_segments=segments,
+            )
+
+        self.assertEqual(max_active_workers, 3)
+        self.assertEqual(
+            result,
+            [
+                "/tmp/first.png.mp4",
+                "/tmp/second.png.mp4",
+                "/tmp/third.png.mp4",
+            ],
+        )
+
+    def test_download_videos_openai_image_fails_if_any_paragraph_image_is_missing(self):
+        config.app["openai_image_parallelism"] = 1
+        segments = [
+            {"text": "First paragraph.", "start": 0.0, "end": 2.0, "duration": 2.0},
+            {"text": "Second paragraph.", "start": 2.0, "end": 4.0, "duration": 2.0},
+            {"text": "Third paragraph.", "start": 4.0, "end": 6.0, "duration": 2.0},
+        ]
+        generated = [
+            [self._generated_item("First paragraph.", "/tmp/first.png")],
+            [],
+        ]
+
+        with (
+            patch(
+                "app.services.material.generate_images_openai",
+                side_effect=generated,
+            ) as generate,
+            patch(
+                "app.services.material._render_openai_image_video",
+                return_value="/tmp/first.png.mp4",
+            ) as render,
+        ):
+            result = material.download_videos(
+                task_id="paragraph-image-failure",
+                search_terms=[],
+                source="openai_image",
+                audio_duration=6,
+                script_segments=segments,
+        )
+
+        self.assertEqual(result, [])
+        self.assertEqual(generate.call_count, 2)
+        # 并发生成阶段会先确认所有段落图片成功，再开始本地编码；避免后续
+        # 段落失败时白白渲染已生成的中间视频。
+        render.assert_not_called()
 
 
 if __name__ == "__main__":

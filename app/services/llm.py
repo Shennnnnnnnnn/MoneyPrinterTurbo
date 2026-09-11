@@ -15,6 +15,7 @@ from openai.types.chat import ChatCompletion
 
 from app.config import config
 from app.models.llm_provider import DEFAULT_LLM_PROVIDER_ID, get_llm_provider
+from app.services import script as script_service
 from app.utils import utils
 
 _max_retries = 5
@@ -22,6 +23,8 @@ MIN_SCRIPT_PARAGRAPH_NUMBER = 1
 MAX_SCRIPT_PARAGRAPH_NUMBER = 10
 MAX_SCRIPT_PROMPT_LENGTH = 2000
 MAX_SCRIPT_SYSTEM_PROMPT_LENGTH = 8000
+MAX_SCRIPT_SEGMENTATION_LENGTH = 20000
+SCRIPT_SEGMENTATION_TIMEOUT_SECONDS = 12.0
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
 _UNCLOSED_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*$", re.IGNORECASE | re.DOTALL)
 _URL_USERINFO_RE = re.compile(
@@ -47,6 +50,8 @@ Generate a script for a video, depending on the subject of the video.
 6. do not include "voiceover", "narrator" or similar indicators of what should be spoken at the beginning of each paragraph or line.
 7. you must not mention the prompt, or anything about the script itself. also, never talk about the amount of paragraphs or lines. just write the script.
 8. respond in the same language as the video subject.
+9. keep each paragraph semantically coherent and normally 3 to 5 spoken phrases long. commas, semicolons, and sentence-ending punctuation each mark a spoken phrase boundary. for unusually short scripts, do not add filler only to reach three phrases.
+10. separate paragraphs with exactly one blank line.
 """.strip()
 
 # Claude Code CLI 默认使用编码 agent 的系统提示词，其中大量约束与文案写作
@@ -254,7 +259,12 @@ def _extract_qwen_generation_text(response) -> str:
     return _normalize_text_response(text, "qwen")
 
 
-def _generate_response(prompt: str, app_config=None) -> str:
+def _generate_response(
+    prompt: str,
+    app_config=None,
+    request_timeout: float | None = None,
+    request_max_retries: int | None = None,
+) -> str:
     try:
         # WebUI 在视频生成期间允许用户准备下一条文案。调用方可以传入提交瞬间
         # 的配置快照，确保模型请求重试期间不会因为后台任务结束并应用新配置，
@@ -609,10 +619,15 @@ def _generate_response(prompt: str, app_config=None) -> str:
             else:
                 raise Exception(f"[{llm_provider}] returned an empty response")
 
-        client = OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-        )
+        client_kwargs = {
+            "api_key": api_key,
+            "base_url": base_url,
+        }
+        if request_timeout is not None:
+            client_kwargs["timeout"] = request_timeout
+        if request_max_retries is not None:
+            client_kwargs["max_retries"] = request_max_retries
+        client = OpenAI(**client_kwargs)
 
         response = client.chat.completions.create(
             model=model_name, messages=[{"role": "user", "content": prompt}]
@@ -714,6 +729,7 @@ def build_script_prompt(
 # Initialization:
 - video subject: {video_subject}
 - number of paragraphs: {paragraph_number}
+- paragraph structure: keep related ideas together and normally use 3 to 5 spoken phrases per paragraph; commas, semicolons, and sentence-ending punctuation each mark a phrase boundary
 """.rstrip()
     if language:
         prompt += f"\n- language: {language}"
@@ -821,6 +837,109 @@ def _strip_code_fence(text: str) -> str:
         t = re.sub(r"^```[a-zA-Z0-9]*\s*", "", t)
         t = re.sub(r"\s*```$", "", t)
     return t.strip()
+
+
+def build_script_segmentation_prompt(video_script: str, language: str = "") -> str:
+    """Ask the model for compact paragraph sizes instead of repeating the script."""
+    script = _limit_script_text(
+        video_script,
+        MAX_SCRIPT_SEGMENTATION_LENGTH,
+        "video_script",
+    )
+    phrases = script_service.split_sentences(script)
+    numbered_phrases = "\n".join(
+        f"{index}. {phrase}" for index, phrase in enumerate(phrases, start=1)
+    )
+    language_line = f"\n- The script language is {language}." if language else ""
+    return f"""
+# Role: Video Script Paragraph Editor
+
+## Goal
+Group the numbered spoken phrases according to meaning and narrative flow.
+
+## Constraints
+1. Preserve the numbered phrase order exactly.
+2. Each paragraph must contain 3 to 5 consecutive spoken phrases.
+3. Keep closely related ideas together and start a new paragraph when the topic, scene, time, or argument changes.
+4. Return only one minified JSON object in this exact shape: {{"paragraph_sizes":[4,5,3]}}.
+5. Every size must be an integer from 3 to 5 and their sum must equal {len(phrases)}.{language_line}
+
+## Numbered Spoken Phrases
+{numbered_phrases}
+""".strip()
+
+
+def _script_content_signature(text: str) -> str:
+    """Ignore whitespace while ensuring paragraphing did not rewrite content."""
+    return re.sub(r"\s+", "", str(text or ""))
+
+
+def _parse_script_paragraph_sizes(response: str, phrase_count: int) -> list[int]:
+    data = json.loads(_strip_code_fence(response))
+    sizes = data.get("paragraph_sizes") if isinstance(data, dict) else None
+    if not isinstance(sizes, list) or not sizes:
+        raise ValueError("paragraphing response is missing paragraph_sizes")
+    if any(isinstance(size, bool) or not isinstance(size, int) for size in sizes):
+        raise ValueError("paragraph_sizes must contain integers")
+    if sum(sizes) != phrase_count:
+        raise ValueError("paragraph_sizes do not cover all spoken phrases")
+    if any(
+        size < script_service.MIN_SENTENCES_PER_PARAGRAPH
+        or size > script_service.MAX_SENTENCES_PER_PARAGRAPH
+        for size in sizes
+    ):
+        raise ValueError("paragraph_sizes must stay between 3 and 5")
+    return sizes
+
+
+def segment_script(
+    video_script: str,
+    language: str = "",
+    app_config=None,
+) -> str:
+    """Use the configured LLM to add semantic paragraph breaks to a script."""
+    original = str(video_script or "").strip()
+    if not original:
+        return ""
+    phrases = script_service.split_sentences(original)
+    fallback = script_service.format_script_paragraphs(
+        script_service.group_script_sentences(original)
+    )
+    if len(phrases) <= script_service.MAX_SENTENCES_PER_PARAGRAPH:
+        return fallback
+    if len(original) > MAX_SCRIPT_SEGMENTATION_LENGTH:
+        logger.warning(
+            "use local paragraphing because the script exceeds the semantic "
+            f"paragraphing limit: length={len(original)}"
+        )
+        return fallback
+
+    prompt = build_script_segmentation_prompt(original, language)
+    started_at = perf_counter()
+    response = _generate_response(
+        prompt,
+        **({"app_config": app_config} if app_config is not None else {}),
+        request_timeout=SCRIPT_SEGMENTATION_TIMEOUT_SECONDS,
+        request_max_retries=0,
+    )
+    elapsed = perf_counter() - started_at
+    try:
+        if response.startswith("Error: "):
+            raise ValueError(response.removeprefix("Error: ").strip())
+        sizes = _parse_script_paragraph_sizes(response, len(phrases))
+        paragraphs = script_service.group_spoken_phrases_by_sizes(phrases, sizes)
+        logger.success(
+            "completed semantic script paragraphing: "
+            f"phrases={len(phrases)}, paragraphs={len(paragraphs)}, "
+            f"elapsed={elapsed:.2f}s"
+        )
+        return script_service.format_script_paragraphs(paragraphs)
+    except Exception as exc:
+        logger.warning(
+            "use local paragraphing after semantic request failed: "
+            f"phrases={len(phrases)}, elapsed={elapsed:.2f}s, error={exc}"
+        )
+        return fallback
 
 
 def generate_terms(
